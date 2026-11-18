@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-pc-guard
+      name: dsh-pc-guard
+      config: {}

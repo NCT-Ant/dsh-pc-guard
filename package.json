@@ -1,0 +1,45 @@
+{
+  "name": "dsh-pc-guard",
+  "version": "0.1.0",
+  "description": "One-click workstation lock, CPU-overload guard and wake suppression for DeepSeek Harness on Windows.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "assets/PcGuard.ps1",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "lock-screen",
+    "cpu-guard",
+    "power-management",
+    "windows"
+  ],
+  "author": "NCT-Ant",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NCT-Ant/dsh-pc-guard.git"
+  },
+  "homepage": "https://github.com/NCT-Ant/dsh-pc-guard#readme",
+  "bugs": {
+    "url": "https://github.com/NCT-Ant/dsh-pc-guard/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

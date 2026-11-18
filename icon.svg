@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="PC Guard">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1f2a44"/>
+  <path d="M22 28v-4a10 10 0 0 1 20 0v4" fill="none" stroke="#7fd1b9" stroke-width="4" stroke-linecap="round"/>
+  <rect x="17" y="28" width="30" height="22" rx="5" fill="#7fd1b9"/>
+  <circle cx="32" cy="38" r="3.2" fill="#1f2a44"/>
+  <rect x="30.6" y="39" width="2.8" height="6" rx="1.4" fill="#1f2a44"/>
+  <path d="M12 55c4-3 7-3 10 0s6 3 10 0 6-3 10 0" fill="none" stroke="#f2c14e" stroke-width="2.4" stroke-linecap="round" opacity="0.9"/>
+</svg>
