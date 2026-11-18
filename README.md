@@ -21,6 +21,12 @@ so nothing else on the machine is touched.
 
 ## Install
 
+Clone the repository, then point DSH at the checkout:
+
+```bash
+git clone https://github.com/NCT-Ant/dsh-pc-guard.git
+```
+
 DSH installs plugin bundles from a local package directory:
 
 ```text
