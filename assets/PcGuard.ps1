@@ -20,7 +20,7 @@ param(
     [int]$ForceResumeMin = 30,
     [int]$NoWakeIdleSec = 120,
     [int]$AutoLockMin = 10,
-    [ValidateSet('ui', 'lock', 'status')]
+    [ValidateSet('ui', 'lock', 'status', 'shortcut')]
     [string]$Action = 'ui',
     [switch]$Headless,
     [switch]$SelfTest
@@ -269,6 +269,20 @@ if ($Action -ne 'ui') {
             }
             Write-Output ($obj | ConvertTo-Json -Compress)
         }
+        'shortcut' {
+            $desktop = [Environment]::GetFolderPath('Desktop')
+            $lnkPath = Join-Path $desktop 'PC守护.lnk'
+            $shell = New-Object -ComObject WScript.Shell
+            $lnk = $shell.CreateShortcut($lnkPath)
+            $lnk.TargetPath = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+            $lnk.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $PSCommandPath)
+            $lnk.WorkingDirectory = (Split-Path -Parent $PSCommandPath)
+            $lnk.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll,54')
+            $lnk.Description = 'PC 守护：一键锁屏 + CPU 守护'
+            $lnk.Save()
+            $o = [ordered]@{ ok = $true; action = 'shortcut'; path = $lnkPath }
+            Write-Output ($o | ConvertTo-Json -Compress)
+        }
     }
     return
 }
@@ -287,7 +301,15 @@ if ($SelfTest) {
 # ---------- 单实例 ----------
 $script:mutex = New-Object System.Threading.Mutex($false, 'Local\PcGuard_SingleInstance')
 if (-not $script:mutex.WaitOne(0)) {
-    Write-Log 'PcGuard 已在运行，本次退出'
+    # 已有实例在跑：把它的窗口拉到前台，而不是再开一个
+    $open = Get-Process -Name powershell -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowTitle -eq 'PC 守护' } |
+        Select-Object -First 1
+    if ($open -and $open.MainWindowHandle -ne 0) {
+        [void][PcGuard.Native]::ShowWindow($open.MainWindowHandle, 9)
+        [void][PcGuard.Native]::SetForegroundWindow($open.MainWindowHandle)
+    }
+    Write-Log 'PcGuard 已在运行，已尝试激活已有窗口'
     if (-not $Headless) { Write-Host 'PcGuard 已在运行' }
     exit 0
 }

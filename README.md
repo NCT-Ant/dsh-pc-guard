@@ -7,6 +7,8 @@ A tiny [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin for Windo
 | --- | --- |
 | `lock` | Locks the current Windows workstation and turns the display off. Background programs keep running; the machine never sleeps, shuts down, or restarts. Unlocking returns to the exact same desktop. |
 | `status` | Samples total CPU usage and the current idle time, so the agent can decide whether the machine is too busy for heavy OCR / video / agent work. |
+| `ui` | Opens the PC Guard panel — the small window with the live CPU readout, one-click lock and the automatic guard. If it is already open, it is brought to the front instead of opening a second copy. |
+| `shortcut` | Puts a **PC 守护** shortcut on the desktop that opens the same panel, so the feature is one double-click away when you are not talking to the agent. |
 
 The repository also ships the standalone `assets/PcGuard.ps1` script it is built on: a small WinForms
 window with a live CPU readout, a one-click lock button, an automatic CPU guard (suspend OCR / agent
@@ -35,11 +37,13 @@ plugin_manager { action: "install_bundle", target: "<absolute path to this direc
 
 Or keep it in a profile as a linked checkout during development.
 
-Once installed, ask the agent to lock the screen, or call the tool directly:
+Once installed, ask the agent to lock the screen, open the panel, or leave a desktop icon, or call the tool directly:
 
 ```text
 pc_guard { action: "lock" }
 pc_guard { action: "status" }
+pc_guard { action: "ui" }        # open the PC Guard panel
+pc_guard { action: "shortcut" }  # put a PC 守护 icon on the desktop
 ```
 
 ## Standalone script
@@ -86,7 +90,9 @@ MIT — see [LICENSE](./LICENSE).
 这是一个 Windows 专用的 DeepSeek Harness 插件，把「一键锁屏 + CPU 守护」包装成 `pc_guard` 工具：
 
 - `lock`：调用 `user32!LockWorkStation` 锁定工作站并关屏，后台程序全部保留，不休眠、不关机；
-- `status`：返回当前 CPU 占用与空闲秒数。
+- `status`：返回当前 CPU 占用与空闲秒数；
+- `ui`：打开 PC 守护小窗（实时 CPU、一键锁屏、自动守护）；已开着就拉到前台；
+- `shortcut`：在桌面生成「PC 守护」快捷方式，双击即可打开同一个小窗。
 
 附带的 `assets/PcGuard.ps1` 也可以脱离 DSH 单独运行，带一个小窗口：实时 CPU、一键锁屏、CPU 超阈值
 自动暂停 OCR / 进程、锁屏后压制自动亮屏。
