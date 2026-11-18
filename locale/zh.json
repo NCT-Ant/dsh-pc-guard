@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "PC 守护",
+    "title": "锁屏管家",
     "description": "一键锁定 Windows 工作站，采样 CPU 占用，并在锁屏期间压制自动亮屏。"
   }
 }

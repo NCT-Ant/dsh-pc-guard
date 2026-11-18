@@ -271,14 +271,14 @@ if ($Action -ne 'ui') {
         }
         'shortcut' {
             $desktop = [Environment]::GetFolderPath('Desktop')
-            $lnkPath = Join-Path $desktop 'PC守护.lnk'
+            $lnkPath = Join-Path $desktop '锁屏管家.lnk'
             $shell = New-Object -ComObject WScript.Shell
             $lnk = $shell.CreateShortcut($lnkPath)
             $lnk.TargetPath = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
             $lnk.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $PSCommandPath)
             $lnk.WorkingDirectory = (Split-Path -Parent $PSCommandPath)
             $lnk.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll,54')
-            $lnk.Description = 'PC 守护：一键锁屏 + CPU 守护'
+            $lnk.Description = '锁屏管家：一键锁屏 + CPU 守护'
             $lnk.Save()
             $o = [ordered]@{ ok = $true; action = 'shortcut'; path = $lnkPath }
             Write-Output ($o | ConvertTo-Json -Compress)
@@ -303,7 +303,7 @@ $script:mutex = New-Object System.Threading.Mutex($false, 'Local\PcGuard_SingleI
 if (-not $script:mutex.WaitOne(0)) {
     # 已有实例在跑：把它的窗口拉到前台，而不是再开一个
     $open = Get-Process -Name powershell -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowTitle -eq 'PC 守护' } |
+        Where-Object { $_.MainWindowTitle -eq '锁屏管家' } |
         Select-Object -First 1
     if ($open -and $open.MainWindowHandle -ne 0) {
         [void][PcGuard.Native]::ShowWindow($open.MainWindowHandle, 9)
@@ -330,7 +330,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'PC 守护'
+$form.Text = '锁屏管家'
 $form.Size = New-Object System.Drawing.Size(470, 640)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
