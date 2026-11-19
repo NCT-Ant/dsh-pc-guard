@@ -8,7 +8,7 @@ A tiny [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin for Windo
 | `lock` | Locks the current Windows workstation and turns the display off. Background programs keep running; the machine never sleeps, shuts down, or restarts. Unlocking returns to the exact same desktop. |
 | `status` | Samples total CPU usage, the current idle time, battery percentage and whether the machine is on AC power, so the agent can decide whether the machine is too busy — or too low on battery — for heavy OCR / video / agent work. |
 | `ui` | Opens the PC Guard panel — the small window with the live CPU readout, one-click lock and the automatic guard. If it is already open, it is brought to the front instead of opening a second copy. |
-| `shortcut` | Puts a **锁屏管家** shortcut on the desktop that opens the same panel, so the feature is one double-click away when you are not talking to the agent. |
+| `shortcut` | Puts a **锁屏管家** shortcut on the desktop that opens the same panel, so the feature is one double-click away when you are not talking to the agent. The shortcut launches through a generated `launch.vbs` (wscript), so Windows never shows a PowerShell console window — and closing that console can no longer take the panel down with it. |
 
 The repository also ships the standalone `assets/PcGuard.ps1` script it is built on: a small WinForms
 window with a live CPU readout, a one-click lock button, an automatic CPU guard (suspend OCR / agent
@@ -107,7 +107,7 @@ MIT — see [LICENSE](./LICENSE).
 - `lock`：调用 `user32!LockWorkStation` 锁定工作站并关屏，后台程序全部保留，不休眠、不关机；
 - `status`：返回当前 CPU 占用、空闲秒数与电池状态（电量、是否接电源）；
 - `ui`：打开 锁屏管家小窗（实时 CPU、一键锁屏、自动守护）；已开着就拉到前台；
-- `shortcut`：在桌面生成「锁屏管家」快捷方式，双击即可打开同一个小窗。
+- `shortcut`：在桌面生成「锁屏管家」快捷方式，双击即可打开同一个小窗。快捷方式实际指向 `assets/launch.vbs`（由 wscript 启动），所以**不会再弹出 PowerShell 黑框**，也就不会出现「关掉黑框把管家一起关掉」的问题。
 
 附带的 `assets/PcGuard.ps1` 也可以脱离 DSH 单独运行，带一个小窗口：实时 CPU、一键锁屏、CPU 超阈值
 自动暂停 OCR / 进程、锁屏后压制自动亮屏，以及**低电量保护**：

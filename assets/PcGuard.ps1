@@ -380,17 +380,27 @@ if ($Action -ne 'ui') {
             Write-Output ($obj | ConvertTo-Json -Compress)
         }
         'shortcut' {
+            # 快捷方式不能直接指向 powershell.exe：Win11 会把它交给 Windows Terminal，
+            # 屏幕上多出一个控制台窗口，关掉它还会把管家一起带走。
+            # 用 wscript 启动器（Run 的第二参数 0 = 隐藏窗口）就没有任何控制台。
+            $vbsPath = Join-Path $script:Root 'launch.vbs'
+            $vbsBody = @"
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$PSCommandPath""", 0, False
+"@
+            [System.IO.File]::WriteAllText($vbsPath, $vbsBody, (New-Object System.Text.UnicodeEncoding($false, $true)))
+
             $desktop = [Environment]::GetFolderPath('Desktop')
             $lnkPath = Join-Path $desktop '锁屏管家.lnk'
             $shell = New-Object -ComObject WScript.Shell
             $lnk = $shell.CreateShortcut($lnkPath)
-            $lnk.TargetPath = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
-            $lnk.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $PSCommandPath)
-            $lnk.WorkingDirectory = (Split-Path -Parent $PSCommandPath)
+            $lnk.TargetPath = (Join-Path $env:SystemRoot 'System32\wscript.exe')
+            $lnk.Arguments = ('"{0}"' -f $vbsPath)
+            $lnk.WorkingDirectory = $script:Root
             $lnk.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll,54')
             $lnk.Description = '锁屏管家：一键锁屏 + CPU 守护'
             $lnk.Save()
-            $o = [ordered]@{ ok = $true; action = 'shortcut'; path = $lnkPath }
+            $o = [ordered]@{ ok = $true; action = 'shortcut'; path = $lnkPath; launcher = $vbsPath }
             Write-Output ($o | ConvertTo-Json -Compress)
         }
     }

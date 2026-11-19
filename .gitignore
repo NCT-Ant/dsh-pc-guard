@@ -3,4 +3,6 @@ node_modules/
 pc-guard.log
 .DS_Store
 Thumbs.db
-ui.png
+ui*.png
+launch.vbs
+pc-guard.custom.txt
