@@ -91,6 +91,13 @@ $script:autoLockMin = $AutoLockMin
 $script:lastLockAt  = [datetime]::MinValue
 $script:lastCpu     = 0
 $script:extraNames  = @()
+try {
+    $customFile = Join-Path $script:Root 'pc-guard.custom.txt'
+    if (Test-Path -LiteralPath $customFile) {
+        $script:extraNames = @((Get-Content -LiteralPath $customFile -Encoding UTF8) |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+} catch { }
 $script:pauseReason = ''
 $script:lowBattery  = $true
 $script:battery     = $null
@@ -216,7 +223,13 @@ $script:OcrPattern = 'ocr|paddle|rapidocr|easyocr|ppocr|tesseract|cnocr|image.?r
 function Get-TargetProcesses {
     param([switch]$IncludeDsh)
     $result = New-Object System.Collections.ArrayList
-    $filter = "Name='python.exe' OR Name='pythonw.exe' OR Name='tesseract.exe' OR Name='DeepSeek Harness.exe'"
+    # 基础目标 + 用户自定义进程名，一起交给 CIM 过滤，避免逐个进程枚举
+    $wqlNames = @("Name='python.exe'", "Name='pythonw.exe'", "Name='tesseract.exe'", "Name='DeepSeek Harness.exe'")
+    foreach ($n in $script:extraNames) {
+        $safe = ([string]$n) -replace "'", "''"
+        if ($safe) { $wqlNames += ("Name LIKE '%{0}%'" -f $safe) }
+    }
+    $filter = ($wqlNames -join ' OR ')
     $procs = @()
     try { $procs = Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop } catch { }
     foreach ($p in $procs) {
@@ -425,128 +438,554 @@ if ($Headless) {
 # ---------- 界面 ----------
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+if (-not ('Guard.T' -as [type])) {
+Add-Type -ReferencedAssemblies 'System.Drawing','System.Windows.Forms' -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Windows.Forms;
+
+namespace Guard {
+  public static class T {
+    public static readonly Color Bg      = Color.FromArgb(247, 248, 252);
+    public static readonly Color Card    = Color.FromArgb(255, 255, 255);
+    public static readonly Color Accent  = Color.FromArgb(77, 107, 254);
+    public static readonly Color Accent2 = Color.FromArgb(45, 60, 152);
+    public static readonly Color AccentSoft = Color.FromArgb(238, 241, 255);
+    public static readonly Color Ink     = Color.FromArgb(24, 26, 34);
+    public static readonly Color Sub     = Color.FromArgb(122, 128, 146);
+    public static readonly Color Line    = Color.FromArgb(233, 235, 242);
+    public static readonly Color Danger  = Color.FromArgb(228, 60, 66);
+    public static readonly Color Warn    = Color.FromArgb(235, 152, 32);
+    public static readonly Color Ok      = Color.FromArgb(20, 158, 88);
+    public static readonly Color Track   = Color.FromArgb(233, 236, 245);
+    public static readonly Color Off     = Color.FromArgb(206, 210, 222);
+
+    public static GraphicsPath Round(Rectangle r, int rad) {
+      var p = new GraphicsPath();
+      int d = rad * 2;
+      if (d <= 2) { p.AddRectangle(r); return p; }
+      if (d > r.Width) d = r.Width;
+      if (d > r.Height) d = r.Height;
+      p.AddArc(r.X, r.Y, d, d, 180, 90);
+      p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+      p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+      p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+      p.CloseFigure();
+      return p;
+    }
+  }
+
+  public class Shell : Form {
+    public Shell() {
+      SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+      DoubleBuffered = true;
+      FormBorderStyle = FormBorderStyle.None;
+      BackColor = T.Bg;
+      Font = new Font("Microsoft YaHei UI", 9f);
+    }
+    protected override CreateParams CreateParams {
+      get { var cp = base.CreateParams; cp.ClassStyle |= 0x20000; return cp; }
+    }
+    protected override void OnResize(EventArgs e) {
+      base.OnResize(e);
+      if (Width > 0 && Height > 0) {
+        using (var p = T.Round(new Rectangle(0, 0, Width, Height), 14)) Region = new Region(p);
+      }
+    }
+  }
+
+  public class Card : Panel {
+    public int Radius = 12;
+    public bool DrawBorder = false;
+    public Card() {
+      SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+      BackColor = T.Card;
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+      var g = e.Graphics;
+      g.SmoothingMode = SmoothingMode.AntiAlias;
+      g.Clear(Parent == null ? T.Bg : Parent.BackColor);
+      var r = new Rectangle(0, 0, Width - 1, Height - 1);
+      using (var path = T.Round(r, Radius)) {
+        using (var b = new SolidBrush(BackColor)) g.FillPath(b, path);
+        if (DrawBorder) using (var pen = new Pen(T.Line, 1f)) g.DrawPath(pen, path);
+      }
+    }
+  }
+
+  public class FlatBtn : Button {
+    public Color Fill = T.Accent;
+    public Color HoverFill = Color.FromArgb(97, 124, 255);
+    public Color DownFill = T.Accent2;
+    public Color TextColor = Color.White;
+    public int Radius = 10;
+    public bool Outline = false;
+    private bool hover, down;
+    public FlatBtn() {
+      SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+      FlatStyle = FlatStyle.Flat;
+      FlatAppearance.BorderSize = 0;
+      Cursor = Cursors.Hand;
+      Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+    }
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+    protected override void OnPaint(PaintEventArgs e) {
+      var g = e.Graphics;
+      g.SmoothingMode = SmoothingMode.AntiAlias;
+      g.Clear(Parent == null ? T.Bg : Parent.BackColor);
+      var r = new Rectangle(0, 0, Width - 1, Height - 1);
+      using (var path = T.Round(r, Radius)) {
+        if (Outline) {
+          using (var b = new SolidBrush(hover ? T.AccentSoft : Color.White)) g.FillPath(b, path);
+          using (var pen = new Pen(hover ? T.Accent : T.Line, 1.4f)) g.DrawPath(pen, path);
+        } else {
+          Color f = down ? DownFill : (hover ? HoverFill : Fill);
+          using (var b = new SolidBrush(f)) g.FillPath(b, path);
+        }
+      }
+      Color tc = Outline ? (hover ? T.Accent : T.Ink) : TextColor;
+      TextRenderer.DrawText(g, Text, Font, r, tc, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+    }
+  }
+
+  public class Toggle : CheckBox {
+    public Toggle() {
+      SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+      Font = new Font("Microsoft YaHei UI", 9f);
+      Cursor = Cursors.Hand;
+      BackColor = T.Bg;
+      Height = 26;
+    }
+    protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+    protected override void OnMouseEnter(EventArgs e) { Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnPaint(PaintEventArgs e) {
+      var g = e.Graphics;
+      g.SmoothingMode = SmoothingMode.AntiAlias;
+      g.Clear(Parent == null ? T.Bg : Parent.BackColor);
+      int tw = 38, th = 21;
+      int ty = (Height - th) / 2;
+      var track = new Rectangle(0, ty, tw, th);
+      using (var path = T.Round(track, th / 2)) {
+        using (var b = new SolidBrush(Checked ? T.Accent : T.Off)) g.FillPath(b, path);
+      }
+      float cx = Checked ? tw - th / 2f : th / 2f;
+      using (var b = new SolidBrush(Color.White)) g.FillEllipse(b, cx - 8.5f, ty + 2.5f, 17f, 17f);
+      using (var b = new SolidBrush(Checked ? T.Ink : Color.FromArgb(96, 100, 116)))
+        g.DrawString(Text, Font, b, new RectangleF(tw + 12, 0, Width - tw - 14, Height),
+          new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap });
+    }
+  }
+
+  public class Bar : Control {
+    public double Value = 0;
+    public Bar() {
+      SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+      BackColor = T.Card;
+    }
+    public void SetValue(double v) { Value = v; Invalidate(); }
+    protected override void OnPaint(PaintEventArgs e) {
+      var g = e.Graphics;
+      g.SmoothingMode = SmoothingMode.AntiAlias;
+      g.Clear(Parent == null ? T.Card : Parent.BackColor);
+      var track = new Rectangle(0, 0, Width - 1, Height - 1);
+      using (var path = T.Round(track, Height / 2)) {
+        using (var b = new SolidBrush(T.Track)) g.FillPath(b, path);
+        int w = (int)(Width * Math.Max(0, Math.Min(100, Value)) / 100.0);
+        if (w > 6) {
+          var fill = new Rectangle(0, 0, w, Height - 1);
+          Color c = Value >= 90 ? T.Danger : (Value >= 70 ? T.Warn : T.Accent);
+          Color c2 = Color.FromArgb(Math.Min(255, c.R + 45), Math.Min(255, c.G + 35), Math.Min(255, c.B + 10));
+          using (var fp = T.Round(fill, Height / 2)) {
+            using (var b2 = new LinearGradientBrush(new Rectangle(0, 0, Math.Max(w, 2), Math.Max(Height, 2)), c, c2, 0f))
+              g.FillPath(b2, fp);
+          }
+        }
+      }
+    }
+  }
+
+  public class Battery : Control {
+    public int Percent = 0;
+    public bool Charging = false;
+    public bool Present = true;
+    public Battery() {
+      SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+      BackColor = T.Card;
+    }
+    public void SetState(int pct, bool charging, bool present) { Percent = pct; Charging = charging; Present = present; Invalidate(); }
+    protected override void OnPaint(PaintEventArgs e) {
+      var g = e.Graphics;
+      g.SmoothingMode = SmoothingMode.AntiAlias;
+      g.Clear(Parent == null ? T.Card : Parent.BackColor);
+      if (!Present) return;
+      int h = 14, w = 28, top = (Height - h) / 2;
+      var body = new Rectangle(0, top, w - 4, h);
+      Color c = Charging ? T.Accent : (Percent <= 20 ? T.Danger : (Percent <= 50 ? T.Warn : T.Ok));
+      using (var pen = new Pen(Color.FromArgb(190, c), 1.5f)) {
+        using (var path = T.Round(body, 4)) g.DrawPath(pen, path);
+      }
+      using (var b = new SolidBrush(Color.FromArgb(190, c))) g.FillRectangle(b, w - 4, top + 4, 3, h - 8);
+      int innerW = body.Width - 7;
+      int fillW = (int)(innerW * Percent / 100.0);
+      if (fillW > 0) {
+        var inner = new Rectangle(2, top + 3, fillW, h - 6);
+        using (var path = T.Round(inner, 2)) using (var b = new SolidBrush(c)) g.FillPath(b, path);
+      }
+    }
+  }
+}
+'@
+}
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$form = New-Object System.Windows.Forms.Form
+$script:CardColor = [Guard.T]::Card
+
+$form = New-Object Guard.Shell
 $form.Text = '锁屏管家'
-$form.Size = New-Object System.Drawing.Size(470, 660)
+$form.ClientSize = New-Object System.Drawing.Size(480, 780)
 $form.StartPosition = 'CenterScreen'
-$form.FormBorderStyle = 'FixedSingle'
-$form.MaximizeBox = $false
-$form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+
+# ---------- 标题栏 ----------
+$titleBar = New-Object System.Windows.Forms.Panel
+$titleBar.Size = New-Object System.Drawing.Size(480, 52)
+$titleBar.Location = New-Object System.Drawing.Point(0, 0)
+$titleBar.BackColor = [Guard.T]::Card
+$form.Controls.Add($titleBar)
+
+$titleBar.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    # 品牌小方块
+    $logoPath = [Guard.T]::Round((New-Object System.Drawing.Rectangle(20, 13, 26, 26)), 8)
+    $bLogo = New-Object System.Drawing.SolidBrush([Guard.T]::Accent)
+    $g.FillPath($bLogo, $logoPath)
+    # 白色锁形
+    $penLock = New-Object System.Drawing.Pen([System.Drawing.Color]::White, 2.0)
+    $g.DrawArc($penLock, 27, 19, 12, 12, 180, 180)
+    $bWhite = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+    $g.FillRectangle($bWhite, 27, 25, 12, 10)
+    # 标题
+    $fTitle = New-Object System.Drawing.Font('Microsoft YaHei UI', 13.5, [System.Drawing.FontStyle]::Bold)
+    $bInk = New-Object System.Drawing.SolidBrush([Guard.T]::Ink)
+    $g.DrawString('锁屏管家', $fTitle, $bInk, 58, 9)
+    $fSub = New-Object System.Drawing.Font('Segoe UI', 7.5)
+    $bSub = New-Object System.Drawing.SolidBrush([Guard.T]::Sub)
+    $g.DrawString('LOCK  &  CPU  GUARD', $fSub, $bSub, 60, 33)
+})
+
+$btnMin = New-Object System.Windows.Forms.Label
+$btnMin.Text = '–'
+$btnMin.Font = New-Object System.Drawing.Font('Segoe UI', 12)
+$btnMin.ForeColor = [Guard.T]::Sub
+$btnMin.BackColor = [Guard.T]::Card
+$btnMin.TextAlign = 'MiddleCenter'
+$btnMin.Size = New-Object System.Drawing.Size(30, 30)
+$btnMin.Location = New-Object System.Drawing.Point(392, 11)
+$btnMin.Cursor = 'Hand'
+$btnMin.Add_Click({ $form.WindowState = 'Minimized' })
+$titleBar.Controls.Add($btnMin)
+
+$btnClose = New-Object System.Windows.Forms.Label
+$btnClose.Text = '×'
+$btnClose.Font = New-Object System.Drawing.Font('Segoe UI', 14)
+$btnClose.ForeColor = [Guard.T]::Sub
+$btnClose.BackColor = [Guard.T]::Card
+$btnClose.TextAlign = 'MiddleCenter'
+$btnClose.Size = New-Object System.Drawing.Size(30, 30)
+$btnClose.Location = New-Object System.Drawing.Point(426, 11)
+$btnClose.Cursor = 'Hand'
+$btnClose.Add_Click({ $form.Close() })
+$btnClose.Add_MouseEnter({ $btnClose.ForeColor = [Guard.T]::Danger })
+$btnClose.Add_MouseLeave({ $btnClose.ForeColor = [Guard.T]::Sub })
+$titleBar.Controls.Add($btnClose)
+
+# 拖动
+$script:dragOrigin = $null
+$script:dragForm = $null
+$titleBar.Add_MouseDown({
+    param($s, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        $script:dragOrigin = $s.PointToScreen($e.Location)
+        $script:dragForm = $form.Location
+    }
+})
+$titleBar.Add_MouseMove({
+    param($s, $e)
+    if ($null -ne $script:dragOrigin -and $e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        $p = $s.PointToScreen($e.Location)
+        $form.Location = New-Object System.Drawing.Point((
+            $script:dragForm.X + ($p.X - $script:dragOrigin.X)),
+            ($script:dragForm.Y + ($p.Y - $script:dragOrigin.Y)))
+    }
+})
+$titleBar.Add_MouseUp({ $script:dragOrigin = $null; $script:dragForm = $null })
+
+# ---------- CPU 卡片 ----------
+$cardCpu = New-Object Guard.Card
+$cardCpu.Location = New-Object System.Drawing.Point(16, 64)
+$cardCpu.Size = New-Object System.Drawing.Size(448, 108)
+$form.Controls.Add($cardCpu)
 
 $lblCpuTitle = New-Object System.Windows.Forms.Label
 $lblCpuTitle.Text = 'CPU 占用'
-$lblCpuTitle.Location = New-Object System.Drawing.Point(18, 14)
+$lblCpuTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$lblCpuTitle.ForeColor = [Guard.T]::Sub
+$lblCpuTitle.BackColor = [System.Drawing.Color]::Transparent
 $lblCpuTitle.AutoSize = $true
-$form.Controls.Add($lblCpuTitle)
+$lblCpuTitle.Location = New-Object System.Drawing.Point(20, 14)
+$cardCpu.Controls.Add($lblCpuTitle)
 
 $lblCpu = New-Object System.Windows.Forms.Label
 $lblCpu.Text = '--'
-$lblCpu.Location = New-Object System.Drawing.Point(14, 30)
-$lblCpu.Size = New-Object System.Drawing.Size(200, 56)
-$lblCpu.Font = New-Object System.Drawing.Font('Segoe UI', 30, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($lblCpu)
+$lblCpu.Font = New-Object System.Drawing.Font('Segoe UI', 34, [System.Drawing.FontStyle]::Bold)
+$lblCpu.ForeColor = [Guard.T]::Accent
+$lblCpu.BackColor = [System.Drawing.Color]::Transparent
+$lblCpu.Location = New-Object System.Drawing.Point(18, 32)
+$lblCpu.Size = New-Object System.Drawing.Size(160, 62)
+$cardCpu.Controls.Add($lblCpu)
 
-$barCpu = New-Object System.Windows.Forms.ProgressBar
-$barCpu.Location = New-Object System.Drawing.Point(215, 44)
-$barCpu.Size = New-Object System.Drawing.Size(225, 24)
-$barCpu.Minimum = 0
-$barCpu.Maximum = 100
-$form.Controls.Add($barCpu)
+$barCpu = New-Object Guard.Bar
+$barCpu.Location = New-Object System.Drawing.Point(196, 62)
+$barCpu.Size = New-Object System.Drawing.Size(232, 10)
+$cardCpu.Controls.Add($barCpu)
+
+$lblThr = New-Object System.Windows.Forms.Label
+$lblThr.Text = ('暂停 {0}%   恢复 {1}%' -f $CpuPause, $CpuResume)
+$lblThr.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+$lblThr.ForeColor = [Guard.T]::Sub
+$lblThr.BackColor = [System.Drawing.Color]::Transparent
+$lblThr.AutoSize = $true
+$lblThr.Location = New-Object System.Drawing.Point(198, 38)
+$cardCpu.Controls.Add($lblThr)
+
+# ---------- 状态卡片 ----------
+$cardStatus = New-Object Guard.Card
+$cardStatus.Location = New-Object System.Drawing.Point(16, 182)
+$cardStatus.Size = New-Object System.Drawing.Size(448, 100)
+$form.Controls.Add($cardStatus)
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Text = '状态：监控中'
-$lblStatus.Location = New-Object System.Drawing.Point(18, 92)
-$lblStatus.Size = New-Object System.Drawing.Size(425, 40)
-$form.Controls.Add($lblStatus)
+$lblStatus.Text = '监控中'
+$lblStatus.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 15, [System.Drawing.FontStyle]::Bold)
+$lblStatus.ForeColor = [Guard.T]::Ink
+$lblStatus.BackColor = [System.Drawing.Color]::Transparent
+$lblStatus.Location = New-Object System.Drawing.Point(20, 14)
+$lblStatus.Size = New-Object System.Drawing.Size(408, 34)
+$cardStatus.Controls.Add($lblStatus)
 
-$chkAuto = New-Object System.Windows.Forms.CheckBox
+$batCtl = New-Object Guard.Battery
+$batCtl.Location = New-Object System.Drawing.Point(20, 58)
+$batCtl.Size = New-Object System.Drawing.Size(30, 18)
+$cardStatus.Controls.Add($batCtl)
+
+$lblBat = New-Object System.Windows.Forms.Label
+$lblBat.Text = '正在读取电池…'
+$lblBat.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+$lblBat.ForeColor = [Guard.T]::Sub
+$lblBat.BackColor = [System.Drawing.Color]::Transparent
+$lblBat.Location = New-Object System.Drawing.Point(58, 54)
+$lblBat.Size = New-Object System.Drawing.Size(368, 24)
+$cardStatus.Controls.Add($lblBat)
+
+# ---------- 开关 ----------
+$chkAuto = New-Object Guard.Toggle
 $chkAuto.Text = ('CPU 超过 {0}% 自动暂停，低于 {1}% 持续 {2} 分钟后恢复' -f $CpuPause, $CpuResume, $ResumeHoldMin)
-$chkAuto.Location = New-Object System.Drawing.Point(18, 136)
-$chkAuto.Size = New-Object System.Drawing.Size(425, 24)
+$chkAuto.Location = New-Object System.Drawing.Point(18, 294)
+$chkAuto.Size = New-Object System.Drawing.Size(444, 26)
 $chkAuto.Checked = $true
 $form.Controls.Add($chkAuto)
 
-$chkDsh = New-Object System.Windows.Forms.CheckBox
+$chkDsh = New-Object Guard.Toggle
 $chkDsh.Text = '同时暂停 DeepSeek Harness 进程（对话界面会暂时冻结）'
-$chkDsh.Location = New-Object System.Drawing.Point(18, 162)
-$chkDsh.Size = New-Object System.Drawing.Size(425, 24)
+$chkDsh.Location = New-Object System.Drawing.Point(18, 324)
+$chkDsh.Size = New-Object System.Drawing.Size(444, 26)
 $chkDsh.Checked = $false
 $form.Controls.Add($chkDsh)
 
-$chkNoWake = New-Object System.Windows.Forms.CheckBox
+$chkNoWake = New-Object Guard.Toggle
 $chkNoWake.Text = '锁屏后压制自动亮屏（无操作时反复关屏）'
-$chkNoWake.Location = New-Object System.Drawing.Point(18, 188)
-$chkNoWake.Size = New-Object System.Drawing.Size(425, 24)
+$chkNoWake.Location = New-Object System.Drawing.Point(18, 354)
+$chkNoWake.Size = New-Object System.Drawing.Size(444, 26)
 $chkNoWake.Checked = $true
 $form.Controls.Add($chkNoWake)
 
-$chkAutoLock = New-Object System.Windows.Forms.CheckBox
+$chkAutoLock = New-Object Guard.Toggle
 $chkAutoLock.Text = ('空闲 {0} 分钟后自动锁屏（锁屏后自动熄屏）' -f $AutoLockMin)
-$chkAutoLock.Location = New-Object System.Drawing.Point(18, 214)
-$chkAutoLock.Size = New-Object System.Drawing.Size(425, 24)
+$chkAutoLock.Location = New-Object System.Drawing.Point(18, 384)
+$chkAutoLock.Size = New-Object System.Drawing.Size(444, 26)
 $chkAutoLock.Checked = $true
 $form.Controls.Add($chkAutoLock)
 
-$chkBattery = New-Object System.Windows.Forms.CheckBox
-$chkBattery.Text = ('低电量保护：未接电源且电量 <= {0}% 时暂停后台任务并进入节能' -f $LowBatteryPct)
-$chkBattery.Location = New-Object System.Drawing.Point(18, 240)
-$chkBattery.Size = New-Object System.Drawing.Size(425, 24)
+$chkBattery = New-Object Guard.Toggle
+$chkBattery.Text = ('低电量保护：未接电源且电量 <= {0}% 时暂停任务并节能' -f $LowBatteryPct)
+$chkBattery.Location = New-Object System.Drawing.Point(18, 414)
+$chkBattery.Size = New-Object System.Drawing.Size(444, 26)
 $chkBattery.Checked = $true
 $form.Controls.Add($chkBattery)
 
+# ---------- 命中进程 ----------
 $lblTargets = New-Object System.Windows.Forms.Label
-$lblTargets.Text = '命中进程（OCR / DSH / 自定义）'
-$lblTargets.Location = New-Object System.Drawing.Point(18, 274)
+$lblTargets.Text = '命中进程'
+$lblTargets.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
+$lblTargets.ForeColor = [Guard.T]::Ink
 $lblTargets.AutoSize = $true
+$lblTargets.Location = New-Object System.Drawing.Point(18, 452)
 $form.Controls.Add($lblTargets)
 
-$lstTargets = New-Object System.Windows.Forms.ListBox
-$lstTargets.Location = New-Object System.Drawing.Point(18, 296)
-$lstTargets.Size = New-Object System.Drawing.Size(425, 96)
-$lstTargets.HorizontalScrollbar = $true
-$form.Controls.Add($lstTargets)
+$lblTargetCount = New-Object System.Windows.Forms.Label
+$lblTargetCount.Text = ''
+$lblTargetCount.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+$lblTargetCount.ForeColor = [Guard.T]::Sub
+$lblTargetCount.AutoSize = $false
+$lblTargetCount.TextAlign = 'MiddleRight'
+$lblTargetCount.Size = New-Object System.Drawing.Size(444, 20)
+$lblTargetCount.Location = New-Object System.Drawing.Point(18, 448)
+$form.Controls.Add($lblTargetCount)
 
-$btnLock = New-Object System.Windows.Forms.Button
+$cardList = New-Object Guard.Card
+$cardList.Location = New-Object System.Drawing.Point(16, 470)
+$cardList.Size = New-Object System.Drawing.Size(448, 110)
+$form.Controls.Add($cardList)
+
+$lstTargets = New-Object System.Windows.Forms.ListBox
+$lstTargets.Location = New-Object System.Drawing.Point(10, 10)
+$lstTargets.Size = New-Object System.Drawing.Size(428, 90)
+$lstTargets.BorderStyle = 'None'
+$lstTargets.BackColor = [Guard.T]::Card
+$lstTargets.ForeColor = [Guard.T]::Ink
+$lstTargets.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+$lstTargets.HorizontalScrollbar = $true
+$cardList.Controls.Add($lstTargets)
+
+# ---------- 自定义进程 ----------
+$cardInput = New-Object Guard.Card
+$cardInput.Location = New-Object System.Drawing.Point(16, 586)
+$cardInput.Size = New-Object System.Drawing.Size(296, 34)
+$cardInput.DrawBorder = $true
+$form.Controls.Add($cardInput)
+
+$txtCustom = New-Object System.Windows.Forms.TextBox
+$txtCustom.Location = New-Object System.Drawing.Point(10, 7)
+$txtCustom.Size = New-Object System.Drawing.Size(276, 20)
+$txtCustom.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$txtCustom.BorderStyle = 'None'
+$txtCustom.BackColor = [Guard.T]::Card
+$cardInput.Controls.Add($txtCustom)
+
+$btnAdd = New-Object Guard.FlatBtn
+$btnAdd.Text = '添加'
+$btnAdd.Location = New-Object System.Drawing.Point(318, 588)
+$btnAdd.Size = New-Object System.Drawing.Size(72, 30)
+$btnAdd.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$btnAdd.Outline = $true
+$btnAdd.Radius = 8
+$form.Controls.Add($btnAdd)
+
+$btnClear = New-Object Guard.FlatBtn
+$btnClear.Text = '清空'
+$btnClear.Location = New-Object System.Drawing.Point(396, 588)
+$btnClear.Size = New-Object System.Drawing.Size(68, 30)
+$btnClear.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$btnClear.Outline = $true
+$btnClear.Radius = 8
+$form.Controls.Add($btnClear)
+
+$lblCustomInfo = New-Object System.Windows.Forms.Label
+$lblCustomInfo.Text = '自定义进程：无'
+$lblCustomInfo.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+$lblCustomInfo.ForeColor = [Guard.T]::Sub
+$lblCustomInfo.Location = New-Object System.Drawing.Point(18, 622)
+$lblCustomInfo.Size = New-Object System.Drawing.Size(444, 18)
+$form.Controls.Add($lblCustomInfo)
+
+# ---------- 三个按钮 ----------
+$btnLock = New-Object Guard.FlatBtn
 $btnLock.Text = '一键锁屏'
-$btnLock.Location = New-Object System.Drawing.Point(18, 412)
-$btnLock.Size = New-Object System.Drawing.Size(200, 46)
-$btnLock.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
+$btnLock.Location = New-Object System.Drawing.Point(16, 648)
+$btnLock.Size = New-Object System.Drawing.Size(200, 48)
+$btnLock.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11.5, [System.Drawing.FontStyle]::Bold)
+$btnLock.Radius = 12
 $form.Controls.Add($btnLock)
 
-$btnPause = New-Object System.Windows.Forms.Button
+$btnPause = New-Object Guard.FlatBtn
 $btnPause.Text = '立即暂停'
-$btnPause.Location = New-Object System.Drawing.Point(228, 412)
-$btnPause.Size = New-Object System.Drawing.Size(105, 46)
+$btnPause.Location = New-Object System.Drawing.Point(228, 648)
+$btnPause.Size = New-Object System.Drawing.Size(112, 48)
+$btnPause.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
+$btnPause.Outline = $true
+$btnPause.Radius = 12
 $form.Controls.Add($btnPause)
 
-$btnResume = New-Object System.Windows.Forms.Button
+$btnResume = New-Object Guard.FlatBtn
 $btnResume.Text = '恢复'
-$btnResume.Location = New-Object System.Drawing.Point(341, 412)
-$btnResume.Size = New-Object System.Drawing.Size(102, 46)
+$btnResume.Location = New-Object System.Drawing.Point(352, 648)
+$btnResume.Size = New-Object System.Drawing.Size(110, 48)
+$btnResume.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
+$btnResume.Outline = $true
+$btnResume.Radius = 12
 $form.Controls.Add($btnResume)
-
-$lblLog = New-Object System.Windows.Forms.Label
-$lblLog.Text = ''
-$lblLog.Location = New-Object System.Drawing.Point(18, 470)
-$lblLog.Size = New-Object System.Drawing.Size(425, 60)
-$lblLog.ForeColor = [System.Drawing.Color]::DimGray
-$form.Controls.Add($lblLog)
 
 $lblHint = New-Object System.Windows.Forms.Label
 $lblHint.Text = '锁屏不会关闭后台程序，也不会休眠；解锁后一切照旧。'
-$lblHint.Location = New-Object System.Drawing.Point(18, 528)
-$lblHint.Size = New-Object System.Drawing.Size(425, 40)
-$lblHint.ForeColor = [System.Drawing.Color]::DimGray
+$lblHint.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+$lblHint.ForeColor = [Guard.T]::Sub
+$lblHint.Location = New-Object System.Drawing.Point(18, 704)
+$lblHint.Size = New-Object System.Drawing.Size(444, 20)
 $form.Controls.Add($lblHint)
+
+$lblLog = New-Object System.Windows.Forms.Label
+$lblLog.Text = ''
+$lblLog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+$lblLog.ForeColor = [Guard.T]::Sub
+$lblLog.Location = New-Object System.Drawing.Point(18, 726)
+$lblLog.Size = New-Object System.Drawing.Size(444, 18)
+$form.Controls.Add($lblLog)
 
 $lblPaused = New-Object System.Windows.Forms.Label
 $lblPaused.Text = ''
-$lblPaused.Location = New-Object System.Drawing.Point(18, 570)
-$lblPaused.Size = New-Object System.Drawing.Size(425, 40)
-$lblPaused.ForeColor = [System.Drawing.Color]::Firebrick
+$lblPaused.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5, [System.Drawing.FontStyle]::Bold)
+$lblPaused.ForeColor = [Guard.T]::Danger
+$lblPaused.Location = New-Object System.Drawing.Point(18, 746)
+$lblPaused.Size = New-Object System.Drawing.Size(444, 20)
 $form.Controls.Add($lblPaused)
+
+# ---------- 逻辑 ----------
+$script:customFile = Join-Path $script:Root 'pc-guard.custom.txt'
+
+function Save-CustomNames {
+    try {
+        if ($script:extraNames.Count -gt 0) {
+            Set-Content -LiteralPath $script:customFile -Value $script:extraNames -Encoding UTF8
+        } elseif (Test-Path -LiteralPath $script:customFile) {
+            Remove-Item -LiteralPath $script:customFile -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Load-CustomNames {
+    if (Test-Path -LiteralPath $script:customFile) {
+        try {
+            $lines = Get-Content -LiteralPath $script:customFile -Encoding UTF8
+            $script:extraNames = @($lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        } catch { }
+    }
+}
+
+function Refresh-CustomInfo {
+    if ($script:extraNames.Count -gt 0) {
+        $lblCustomInfo.Text = ('自定义进程：{0}' -f ($script:extraNames -join '、'))
+    } else {
+        $lblCustomInfo.Text = '自定义进程：无（在上面输入进程名，例如 ffmpeg、chrome）'
+    }
+}
 
 function Refresh-TargetList {
     $items = @(Get-TargetProcesses -IncludeDsh:$chkDsh.Checked)
@@ -554,16 +993,40 @@ function Refresh-TargetList {
     $lstTargets.Items.Clear()
     foreach ($t in $items) {
         $short = $t.Cmd
-        if ($short.Length -gt 70) { $short = $short.Substring(0, 70) + '...' }
+        if ($short.Length -gt 62) { $short = $short.Substring(0, 62) + '...' }
         [void]$lstTargets.Items.Add(('[#{0}] {1} · {2} · {3}' -f $t.Id, $t.Kind, $t.Name, $short))
     }
     if ($lstTargets.Items.Count -eq 0) {
-        [void]$lstTargets.Items.Add('（当前没有匹配的 OCR / DSH 进程）')
+        [void]$lstTargets.Items.Add('（当前没有匹配的进程）')
     }
     $lstTargets.EndUpdate()
+    $lblTargetCount.Text = ('{0} 个' -f $items.Count)
 }
 
-$script:logLines = New-Object System.Collections.ArrayList
+$btnAdd.Add_Click({
+    $name = ($txtCustom.Text -replace '\.exe$', '').Trim()
+    if (-not $name) { return }
+    if ($script:extraNames -notcontains $name) {
+        $script:extraNames = @($script:extraNames) + $name
+        Save-CustomNames
+        Write-Log ("添加自定义进程：$name")
+    }
+    $txtCustom.Text = ''
+    Refresh-CustomInfo
+    Refresh-TargetList
+})
+
+$txtCustom.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $btnAdd.PerformClick() }
+})
+
+$btnClear.Add_Click({
+    $script:extraNames = @()
+    Save-CustomNames
+    Refresh-CustomInfo
+    Refresh-TargetList
+})
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $IntervalSec * 1000
@@ -571,37 +1034,46 @@ $timer.Add_Tick({
     $cpu = Update-State
     try { Invoke-BatteryTick } catch { }
     if ($cpu -ge 0) {
-        $lblCpu.Text = ('{0}%' -f [int][math]::Round($cpu))
-        if ($cpu -gt 100) { $cpu = 100 }
-        $barCpu.Value = [int][math]::Min(100, [math]::Max(0, [math]::Round($cpu)))
-        if ($cpu -ge $CpuPause) { $lblCpu.ForeColor = [System.Drawing.Color]::Firebrick }
-        else { $lblCpu.ForeColor = [System.Drawing.Color]::FromArgb(30, 120, 60) }
-    }
-    $batTxt = ''
-    if ($script:battery) {
-        if ($script:battery.HasBattery) {
-            $ac = '未接电源'
-            if ($script:battery.OnAC) { $ac = '已接电源' }
-            $batTxt = (' · 电池 {0}% {1}' -f $script:battery.Percent, $ac)
-        } else {
-            $batTxt = ' · 未检测到电池'
-        }
+        $lblCpu.Text = ('{0}' -f [int][math]::Round($cpu))
+        $barCpu.SetValue([double]$cpu)
+        if ($cpu -ge $CpuPause) { $lblCpu.ForeColor = [Guard.T]::Danger }
+        elseif ($cpu -ge 70) { $lblCpu.ForeColor = [Guard.T]::Warn }
+        else { $lblCpu.ForeColor = [Guard.T]::Accent }
     }
 
+    if ($script:battery -and $script:battery.HasBattery) {
+        $batCtl.SetState([int]$script:battery.Percent, [bool]$script:battery.OnAC, $true)
+        $acTxt = '未接电源'
+        if ($script:battery.OnAC) { $acTxt = '已接电源' }
+        $leftTxt = ''
+        if (-not $script:battery.OnAC -and $script:battery.Percent -le $LowBatteryPct) {
+            $leftTxt = ('  ·  低于 {0}%，即将进入保护' -f $LowBatteryPct)
+        }
+        $lblBat.Text = ('电池 {0}%  ·  {1}{2}' -f $script:battery.Percent, $acTxt, $leftTxt)
+        $lblBat.ForeColor = if ($script:battery.Percent -le $LowBatteryPct -and -not $script:battery.OnAC) { [Guard.T]::Danger } else { [Guard.T]::Sub }
+    } elseif ($script:battery) {
+        $batCtl.SetState(0, $false, $false)
+        $lblBat.Text = '未检测到电池（台式机）'
+        $lblBat.ForeColor = [Guard.T]::Sub
+    }
+
+    $lockPrefix = ''
+    if ($script:locked) { $lockPrefix = '已锁屏  ·  ' }
     if ($script:pausedIds.Count -gt 0) {
         $mins = 0
         if ($script:pausedAt) { $mins = [math]::Round(((Get-Date) - $script:pausedAt).TotalMinutes, 1) }
         $why = ''
         if ($script:pauseReason -eq 'battery') { $why = '（低电量）' }
-        $lblStatus.Text = ('状态：已暂停 {0} 个进程{1}，已持续 {2} 分钟{3}' -f $script:pausedIds.Count, $why, $mins, $batTxt)
+        $lblStatus.Text = ('{0}已暂停 {1} 个进程{2} · {3} 分钟' -f $lockPrefix, $script:pausedIds.Count, $why, $mins)
+        $lblStatus.ForeColor = [Guard.T]::Danger
         $lblPaused.Text = ('已暂停 PID：{0}' -f ($script:pausedIds -join ', '))
     } else {
-        $lblStatus.Text = ('状态：监控中（暂停阈值 {0}%，恢复阈值 {1}%）{2}' -f $CpuPause, $CpuResume, $batTxt)
+        $lblStatus.Text = ('{0}监控中' -f $lockPrefix)
+        $lblStatus.ForeColor = [Guard.T]::Ink
         $lblPaused.Text = ''
     }
-    if ($script:locked) { $lblStatus.Text = '状态：已锁屏 · ' + $lblStatus.Text.Replace('状态：', '') }
 
-    # 空闲自动锁屏：解锁状态下长时间无输入 -> 锁屏并熄屏
+    # 空闲自动锁屏
     if ($script:autoLock -and -not $script:locked) {
         $idle = Get-IdleSeconds
         if ($idle -ge ($script:autoLockMin * 60)) {
@@ -624,7 +1096,8 @@ $timerNoWake.Start()
 
 $btnLock.Add_Click({
     Lock-Screen
-    $lblStatus.Text = '状态：已锁屏（后台继续运行）'
+    $lblStatus.Text = '已锁屏  ·  后台继续运行'
+    $lblStatus.ForeColor = [Guard.T]::Ink
 })
 $btnPause.Add_Click({
     Pause-All '手动暂停'
@@ -655,14 +1128,14 @@ Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName Se
 } | Out-Null
 
 $form.Add_Shown({
-    # 以隐藏窗口方式启动时，STARTUPINFO 的 SW_HIDE 会被首次 ShowWindow 采用，
-    # 导致 WinForms 窗口不可见。这里在显示后再显式 ShowWindow 一次。
     try {
         [void][PcGuard.Native]::ShowWindow($form.Handle, 1)
         [void][PcGuard.Native]::ShowWindow($form.Handle, 5)
         [void][PcGuard.Native]::SetForegroundWindow($form.Handle)
         $form.Activate()
     } catch {}
+    Load-CustomNames
+    Refresh-CustomInfo
     Refresh-TargetList
     Write-Log '界面已启动'
 })

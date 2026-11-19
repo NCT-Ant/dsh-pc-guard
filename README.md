@@ -63,6 +63,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File assets/PcGuard.ps1 -Headless
 Parameters: `-CpuPause 90 -CpuResume 40 -ResumeHoldMin 5 -IntervalSec 3 -PauseStreak 3
 -ForceResumeMin 30 -NoWakeIdleSec 120 -AutoLockMin 10 -LowBatteryPct 20 -LowBatteryResumePct 25`.
 
+## Panel
+
+The panel is drawn with a custom theme inspired by the DeepSeek blue — rounded cards, pill toggles and no
+native Windows chrome — instead of stock WinForms controls:
+
+- live CPU readout with a threshold-aware bar (blue → amber → red),
+- the guard state as one large line, plus a dedicated battery row whose icon fills up as the charge drops,
+- five toggles: CPU guard, include DSH, keep the screen off, idle auto-lock, low-battery guard,
+- the list of matching processes and a custom-name entry field,
+- one-click lock, pause-now and resume buttons.
+
+`命中进程` picks up OCR and DSH processes automatically. Anything else can be added by typing its name
+(for example `ffmpeg` or `chrome`) into the field and pressing **添加**; entries persist in
+`assets/pc-guard.custom.txt` and are matched case-insensitively as a substring of the process name.
+
 ## Requirements and limits
 
 - **Windows only.** The tool returns an error on other platforms.
@@ -101,5 +116,16 @@ MIT — see [LICENSE](./LICENSE).
 - 电量降到 20%（可调 `-LowBatteryPct`）时自动暂停所有后台任务，并把电源计划切到「节能」，省电优先；
 - 插上电源或电量回升到 25%（可调 `-LowBatteryResumePct`）后自动恢复任务与原来的电源计划；
 - 界面里第五个复选框可以随时关掉它，关掉时若正因低电量暂停会立即恢复。
+
+**界面**采用 DeepSeek 蓝主题自绘（圆角卡片、胶囊开关、去掉了系统默认按钮外观），不再使用 WinForms 原生控件：
+
+- CPU 大号数字配阈值渐变进度条（蓝 → 橙 → 红）；
+- 「状态」单独一行大字加粗，下面是独立的电池行，左侧图标随电量填充；
+- 五个胶囊开关：CPU 守护、含 DSH、压制亮屏、空闲自动锁屏、低电量保护；
+- 命中进程列表 + 自定义进程输入框；
+- 一键锁屏 / 立即暂停 / 恢复 三个按钮。
+
+**命中进程**会自动识别 OCR 与 DSH 进程；其它程序（如 `ffmpeg`、`chrome`）可以把进程名输入到
+输入框点「添加」，名单保存在 `assets/pc-guard.custom.txt`，按「进程名包含该字符串」匹配，重启后仍在。
 
 安装：用 `plugin_manager` 的 `install_bundle` 指向本目录绝对路径即可。
