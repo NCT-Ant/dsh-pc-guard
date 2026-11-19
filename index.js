@@ -77,7 +77,11 @@ function describe(value) {
   if (value.action === 'ui') return 'PC Guard panel opened. It keeps running after this conversation.'
   if (value.action === 'shortcut') return `Desktop shortcut ready: ${value.path ?? '锁屏管家.lnk'}`
   if (typeof value.cpu === 'number') {
-    return `CPU ${value.cpu}% · idle ${Math.round(value.idleSec ?? 0)}s · ${value.targets ?? 0} guard target(s)`
+    let battery = ''
+    if (typeof value.batteryPct === 'number' && value.batteryPct >= 0) {
+      battery = ` · battery ${value.batteryPct}% ${value.onAC ? 'on AC' : 'on battery'}`
+    }
+    return `CPU ${value.cpu}% · idle ${Math.round(value.idleSec ?? 0)}s · ${value.targets ?? 0} guard target(s)${battery}`
   }
   return 'pc_guard finished.'
 }
@@ -94,9 +98,11 @@ export function apply(ctx) {
         'Windows-only power helper for this machine. '
         + 'action="lock" immediately locks the workstation (same effect as Win+L: every background program keeps running, '
         + 'nothing sleeps or shuts down). '
-        + 'action="status" samples total CPU usage and user idle time so you can judge machine load before starting heavy work. '
+        + 'action="status" samples total CPU usage, user idle time, battery percentage and whether the machine is on AC power, '
+        + 'so you can judge machine load before starting heavy work. '
         + 'action="ui" opens the PC Guard panel: a small window with a live CPU gauge, a one-click lock button, '
-        + 'and switches that pause OCR/DSH processes above 90% CPU and resume them below 40%. '
+        + 'switches that pause OCR/DSH processes above 90% CPU and resume them below 40%, '
+        + 'and a low-battery guard that pauses background work and enters power-saver mode when the laptop runs on battery below 20%. '
         + 'action="shortcut" (re)creates the "锁屏管家" desktop shortcut that opens that panel. '
         + 'Call this when the user asks to lock the screen, open the PC Guard panel, put a PC Guard icon on the desktop, '
         + 'or asks how loaded the machine currently is.',

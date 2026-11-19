@@ -6,13 +6,13 @@ A tiny [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin for Windo
 | action | what it does |
 | --- | --- |
 | `lock` | Locks the current Windows workstation and turns the display off. Background programs keep running; the machine never sleeps, shuts down, or restarts. Unlocking returns to the exact same desktop. |
-| `status` | Samples total CPU usage and the current idle time, so the agent can decide whether the machine is too busy for heavy OCR / video / agent work. |
+| `status` | Samples total CPU usage, the current idle time, battery percentage and whether the machine is on AC power, so the agent can decide whether the machine is too busy — or too low on battery — for heavy OCR / video / agent work. |
 | `ui` | Opens the PC Guard panel — the small window with the live CPU readout, one-click lock and the automatic guard. If it is already open, it is brought to the front instead of opening a second copy. |
 | `shortcut` | Puts a **锁屏管家** shortcut on the desktop that opens the same panel, so the feature is one double-click away when you are not talking to the agent. |
 
 The repository also ships the standalone `assets/PcGuard.ps1` script it is built on: a small WinForms
 window with a live CPU readout, a one-click lock button, an automatic CPU guard (suspend OCR / agent
-processes above a threshold, resume after the load drops), and a "keep the display off while locked" loop.
+processes above a threshold, resume after the load drops), a low-battery guard, and a "keep the display off while locked" loop.
 
 ## Why
 
@@ -61,7 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File assets/PcGuard.ps1 -Headless
 ```
 
 Parameters: `-CpuPause 90 -CpuResume 40 -ResumeHoldMin 5 -IntervalSec 3 -PauseStreak 3
--ForceResumeMin 30 -NoWakeIdleSec 120 -AutoLockMin 10`.
+-ForceResumeMin 30 -NoWakeIdleSec 120 -AutoLockMin 10 -LowBatteryPct 20 -LowBatteryResumePct 25`.
 
 ## Requirements and limits
 
@@ -90,11 +90,16 @@ MIT — see [LICENSE](./LICENSE).
 这是一个 Windows 专用的 DeepSeek Harness 插件，把「一键锁屏 + CPU 守护」包装成 `pc_guard` 工具：
 
 - `lock`：调用 `user32!LockWorkStation` 锁定工作站并关屏，后台程序全部保留，不休眠、不关机；
-- `status`：返回当前 CPU 占用与空闲秒数；
+- `status`：返回当前 CPU 占用、空闲秒数与电池状态（电量、是否接电源）；
 - `ui`：打开 锁屏管家小窗（实时 CPU、一键锁屏、自动守护）；已开着就拉到前台；
 - `shortcut`：在桌面生成「锁屏管家」快捷方式，双击即可打开同一个小窗。
 
 附带的 `assets/PcGuard.ps1` 也可以脱离 DSH 单独运行，带一个小窗口：实时 CPU、一键锁屏、CPU 超阈值
-自动暂停 OCR / 进程、锁屏后压制自动亮屏。
+自动暂停 OCR / 进程、锁屏后压制自动亮屏，以及**低电量保护**：
+
+- 仅当「未接电源 + 有 OCR / agent 后台任务」时生效；
+- 电量降到 20%（可调 `-LowBatteryPct`）时自动暂停所有后台任务，并把电源计划切到「节能」，省电优先；
+- 插上电源或电量回升到 25%（可调 `-LowBatteryResumePct`）后自动恢复任务与原来的电源计划；
+- 界面里第五个复选框可以随时关掉它，关掉时若正因低电量暂停会立即恢复。
 
 安装：用 `plugin_manager` 的 `install_bundle` 指向本目录绝对路径即可。

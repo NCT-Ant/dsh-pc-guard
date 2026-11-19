@@ -20,6 +20,8 @@ param(
     [int]$ForceResumeMin = 30,
     [int]$NoWakeIdleSec = 120,
     [int]$AutoLockMin = 10,
+    [int]$LowBatteryPct = 20,
+    [int]$LowBatteryResumePct = 25,
     [ValidateSet('ui', 'lock', 'status', 'shortcut')]
     [string]$Action = 'ui',
     [switch]$Headless,
@@ -56,6 +58,16 @@ namespace PcGuard {
     [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
     [StructLayout(LayoutKind.Sequential)]
     public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("kernel32.dll")] public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS lpSystemPowerStatus);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SYSTEM_POWER_STATUS {
+      public byte ACLineStatus;
+      public byte BatteryFlag;
+      public byte BatteryLifePercent;
+      public byte SystemStatusFlag;
+      public int BatteryLifeTime;
+      public int BatteryFullLifeTime;
+    }
   }
 }
 '@
@@ -79,6 +91,12 @@ $script:autoLockMin = $AutoLockMin
 $script:lastLockAt  = [datetime]::MinValue
 $script:lastCpu     = 0
 $script:extraNames  = @()
+$script:pauseReason = ''
+$script:lowBattery  = $true
+$script:battery     = $null
+$script:saverOn     = $false
+$script:prevScheme  = $null
+$SCRIPT:SAVER_GUID  = 'a1841308-3541-4fab-bc81-f71556f20b4a'
 
 $script:cpuCounter = $null
 try {
@@ -106,6 +124,78 @@ function Get-IdleSeconds {
         return [math]::Round($delta / 1000.0, 1)
     }
     return -1
+}
+
+function Get-BatteryInfo {
+    $sps = New-Object PcGuard.Native+SYSTEM_POWER_STATUS
+    try {
+        if ([PcGuard.Native]::GetSystemPowerStatus([ref]$sps)) {
+            $pct = [int]$sps.BatteryLifePercent
+            $noBattery = (($sps.BatteryFlag -band 0x80) -ne 0) -or ($pct -gt 100)
+            if ($pct -gt 100) { $pct = -1 }
+            return [pscustomobject]@{
+                HasBattery = (-not $noBattery)
+                Percent    = $pct
+                OnAC       = ($sps.ACLineStatus -eq 1)
+            }
+        }
+    } catch { }
+    return [pscustomobject]@{ HasBattery = $false; Percent = -1; OnAC = $true }
+}
+
+function Get-ActiveScheme {
+    try {
+        $out = & powercfg /getactivescheme 2>$null | Out-String
+        if ($out -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+            return $matches[1]
+        }
+    } catch { }
+    return $null
+}
+
+function Set-PowerSaver {
+    param([switch]$On)
+    try {
+        if ($On) {
+            if ($script:saverOn) { return }
+            $cur = Get-ActiveScheme
+            if ($cur -and $cur -ne $SCRIPT:SAVER_GUID) { $script:prevScheme = $cur }
+            & powercfg /setactive $SCRIPT:SAVER_GUID | Out-Null
+            $script:saverOn = $true
+            Write-Log '已切换到节能电源计划（低电量模式）'
+        } else {
+            if (-not $script:saverOn) { return }
+            if ($script:prevScheme) { & powercfg /setactive $script:prevScheme | Out-Null }
+            $script:saverOn = $false
+            $script:prevScheme = $null
+            Write-Log '已恢复原来的电源计划'
+        }
+    } catch { Write-Log "切换电源计划失败：$($_.Exception.Message)" }
+}
+
+function Invoke-BatteryTick {
+    if (-not $script:lowBattery) { return }
+    $b = Get-BatteryInfo
+    $script:battery = $b
+    if (-not $b.HasBattery) { return }
+
+    $low = (-not $b.OnAC) -and ($b.Percent -ge 0) -and ($b.Percent -le $LowBatteryPct)
+    if ($low) {
+        if ($script:pausedIds.Count -eq 0) {
+            $targets = @(Get-TargetProcesses -IncludeDsh:$script:includeDsh)
+            if ($targets.Count -gt 0) {
+                Pause-All ('电池 {0}% 低于 {1}%，且未接电源' -f $b.Percent, $LowBatteryPct) 'battery'
+                Set-PowerSaver -On
+            }
+        } else {
+            Set-PowerSaver -On
+        }
+    } else {
+        if ($script:saverOn) { Set-PowerSaver }
+        if ($script:pauseReason -eq 'battery' -and ($b.OnAC -or $b.Percent -ge $LowBatteryResumePct -or $b.Percent -lt 0)) {
+            Resume-All ('已接电源或电量回升到 {0}%' -f $b.Percent)
+        }
+    }
 }
 
 function Close-Monitor {
@@ -171,7 +261,7 @@ function Resume-Pid {
 }
 
 function Pause-All {
-    param([string]$Reason)
+    param([string]$Reason, [string]$Kind = 'cpu')
     if ($script:pausedIds.Count -gt 0) { return }
     $targets = @(Get-TargetProcesses -IncludeDsh:$script:includeDsh)
     if ($targets.Count -eq 0) {
@@ -186,6 +276,7 @@ function Pause-All {
         $script:pausedIds = @($ok)
         $script:pausedAt = Get-Date
         $script:lowSince = $null
+        $script:pauseReason = $Kind
         Write-Log ("已暂停 {0} 个进程（{1}）：{2}" -f $ok.Count, $Reason, ($ok -join ','))
     } else {
         Write-Log "暂停失败（$Reason），可能是权限不足"
@@ -204,6 +295,7 @@ function Resume-All {
     $script:pausedAt = $null
     $script:lowSince = $null
     $script:highStreak = 0
+    $script:pauseReason = ''
 }
 
 function Update-State {
@@ -212,6 +304,8 @@ function Update-State {
     $script:lastCpu = $cpu
 
     if ($script:pausedIds.Count -gt 0) {
+        # 低电量引起的暂停只由电池状态解除，不套用 CPU 的 30 分钟强制恢复，否则会继续耗电
+        if ($script:pauseReason -eq 'battery') { return $cpu }
         if ($script:pausedAt -and ((Get-Date) - $script:pausedAt).TotalMinutes -ge $ForceResumeMin) {
             Resume-All "暂停超过 $ForceResumeMin 分钟，强制恢复"
             return $cpu
@@ -260,12 +354,15 @@ if ($Action -ne 'ui') {
             $cpu = Get-CpuPercent
             if ($cpu -lt 0) { $cpu = 0 }
             $targets = @(Get-TargetProcesses)
+            $bat = Get-BatteryInfo
             $obj = [ordered]@{
-                ok        = $true
-                cpu       = [math]::Round($cpu, 1)
-                idleSec   = (Get-IdleSeconds)
-                targets   = $targets.Count
-                timestamp = (Get-Date -Format 's')
+                ok         = $true
+                cpu        = [math]::Round($cpu, 1)
+                idleSec    = (Get-IdleSeconds)
+                targets    = $targets.Count
+                batteryPct = $bat.Percent
+                onAC       = $bat.OnAC
+                timestamp  = (Get-Date -Format 's')
             }
             Write-Output ($obj | ConvertTo-Json -Compress)
         }
@@ -319,6 +416,7 @@ if ($Headless) {
     Write-Log "PcGuard 无界面守护启动：暂停阈值 $CpuPause%，恢复阈值 $CpuResume% / $ResumeHoldMin 分钟"
     while ($true) {
         [void](Update-State)
+        Invoke-BatteryTick
         Invoke-NoWakeTick
         Start-Sleep -Seconds $IntervalSec
     }
@@ -331,7 +429,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '锁屏管家'
-$form.Size = New-Object System.Drawing.Size(470, 640)
+$form.Size = New-Object System.Drawing.Size(470, 660)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -391,54 +489,61 @@ $chkAutoLock.Size = New-Object System.Drawing.Size(425, 24)
 $chkAutoLock.Checked = $true
 $form.Controls.Add($chkAutoLock)
 
+$chkBattery = New-Object System.Windows.Forms.CheckBox
+$chkBattery.Text = ('低电量保护：未接电源且电量 <= {0}% 时暂停后台任务并进入节能' -f $LowBatteryPct)
+$chkBattery.Location = New-Object System.Drawing.Point(18, 240)
+$chkBattery.Size = New-Object System.Drawing.Size(425, 24)
+$chkBattery.Checked = $true
+$form.Controls.Add($chkBattery)
+
 $lblTargets = New-Object System.Windows.Forms.Label
 $lblTargets.Text = '命中进程（OCR / DSH / 自定义）'
-$lblTargets.Location = New-Object System.Drawing.Point(18, 248)
+$lblTargets.Location = New-Object System.Drawing.Point(18, 274)
 $lblTargets.AutoSize = $true
 $form.Controls.Add($lblTargets)
 
 $lstTargets = New-Object System.Windows.Forms.ListBox
-$lstTargets.Location = New-Object System.Drawing.Point(18, 270)
-$lstTargets.Size = New-Object System.Drawing.Size(425, 118)
+$lstTargets.Location = New-Object System.Drawing.Point(18, 296)
+$lstTargets.Size = New-Object System.Drawing.Size(425, 96)
 $lstTargets.HorizontalScrollbar = $true
 $form.Controls.Add($lstTargets)
 
 $btnLock = New-Object System.Windows.Forms.Button
 $btnLock.Text = '一键锁屏'
-$btnLock.Location = New-Object System.Drawing.Point(18, 400)
+$btnLock.Location = New-Object System.Drawing.Point(18, 412)
 $btnLock.Size = New-Object System.Drawing.Size(200, 46)
 $btnLock.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($btnLock)
 
 $btnPause = New-Object System.Windows.Forms.Button
 $btnPause.Text = '立即暂停'
-$btnPause.Location = New-Object System.Drawing.Point(228, 400)
+$btnPause.Location = New-Object System.Drawing.Point(228, 412)
 $btnPause.Size = New-Object System.Drawing.Size(105, 46)
 $form.Controls.Add($btnPause)
 
 $btnResume = New-Object System.Windows.Forms.Button
 $btnResume.Text = '恢复'
-$btnResume.Location = New-Object System.Drawing.Point(341, 400)
+$btnResume.Location = New-Object System.Drawing.Point(341, 412)
 $btnResume.Size = New-Object System.Drawing.Size(102, 46)
 $form.Controls.Add($btnResume)
 
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text = ''
-$lblLog.Location = New-Object System.Drawing.Point(18, 456)
+$lblLog.Location = New-Object System.Drawing.Point(18, 470)
 $lblLog.Size = New-Object System.Drawing.Size(425, 60)
 $lblLog.ForeColor = [System.Drawing.Color]::DimGray
 $form.Controls.Add($lblLog)
 
 $lblHint = New-Object System.Windows.Forms.Label
 $lblHint.Text = '锁屏不会关闭后台程序，也不会休眠；解锁后一切照旧。'
-$lblHint.Location = New-Object System.Drawing.Point(18, 522)
+$lblHint.Location = New-Object System.Drawing.Point(18, 528)
 $lblHint.Size = New-Object System.Drawing.Size(425, 40)
 $lblHint.ForeColor = [System.Drawing.Color]::DimGray
 $form.Controls.Add($lblHint)
 
 $lblPaused = New-Object System.Windows.Forms.Label
 $lblPaused.Text = ''
-$lblPaused.Location = New-Object System.Drawing.Point(18, 566)
+$lblPaused.Location = New-Object System.Drawing.Point(18, 570)
 $lblPaused.Size = New-Object System.Drawing.Size(425, 40)
 $lblPaused.ForeColor = [System.Drawing.Color]::Firebrick
 $form.Controls.Add($lblPaused)
@@ -464,6 +569,7 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $IntervalSec * 1000
 $timer.Add_Tick({
     $cpu = Update-State
+    try { Invoke-BatteryTick } catch { }
     if ($cpu -ge 0) {
         $lblCpu.Text = ('{0}%' -f [int][math]::Round($cpu))
         if ($cpu -gt 100) { $cpu = 100 }
@@ -471,13 +577,26 @@ $timer.Add_Tick({
         if ($cpu -ge $CpuPause) { $lblCpu.ForeColor = [System.Drawing.Color]::Firebrick }
         else { $lblCpu.ForeColor = [System.Drawing.Color]::FromArgb(30, 120, 60) }
     }
+    $batTxt = ''
+    if ($script:battery) {
+        if ($script:battery.HasBattery) {
+            $ac = '未接电源'
+            if ($script:battery.OnAC) { $ac = '已接电源' }
+            $batTxt = (' · 电池 {0}% {1}' -f $script:battery.Percent, $ac)
+        } else {
+            $batTxt = ' · 未检测到电池'
+        }
+    }
+
     if ($script:pausedIds.Count -gt 0) {
         $mins = 0
         if ($script:pausedAt) { $mins = [math]::Round(((Get-Date) - $script:pausedAt).TotalMinutes, 1) }
-        $lblStatus.Text = ('状态：已暂停 {0} 个进程，已持续 {1} 分钟' -f $script:pausedIds.Count, $mins)
+        $why = ''
+        if ($script:pauseReason -eq 'battery') { $why = '（低电量）' }
+        $lblStatus.Text = ('状态：已暂停 {0} 个进程{1}，已持续 {2} 分钟{3}' -f $script:pausedIds.Count, $why, $mins, $batTxt)
         $lblPaused.Text = ('已暂停 PID：{0}' -f ($script:pausedIds -join ', '))
     } else {
-        $lblStatus.Text = ('状态：监控中（暂停阈值 {0}%，恢复阈值 {1}%）' -f $CpuPause, $CpuResume)
+        $lblStatus.Text = ('状态：监控中（暂停阈值 {0}%，恢复阈值 {1}%）{2}' -f $CpuPause, $CpuResume, $batTxt)
         $lblPaused.Text = ''
     }
     if ($script:locked) { $lblStatus.Text = '状态：已锁屏 · ' + $lblStatus.Text.Replace('状态：', '') }
@@ -519,6 +638,15 @@ $chkDsh.Add_CheckedChanged({ $script:includeDsh = $chkDsh.Checked; Refresh-Targe
 $chkAuto.Add_CheckedChanged({ $script:autoGuard = $chkAuto.Checked })
 $chkNoWake.Add_CheckedChanged({ $script:noWake = $chkNoWake.Checked })
 $chkAutoLock.Add_CheckedChanged({ $script:autoLock = $chkAutoLock.Checked })
+$chkBattery.Add_CheckedChanged({
+    $script:lowBattery = $chkBattery.Checked
+    if (-not $script:lowBattery) {
+        if ($script:pauseReason -eq 'battery') { Resume-All '用户关闭了低电量保护' }
+        if ($script:saverOn) { Set-PowerSaver }
+    } else {
+        try { Invoke-BatteryTick } catch { }
+    }
+})
 
 Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName SessionSwitch -Action {
     $reason = $Event.SourceEventArgs.Reason
