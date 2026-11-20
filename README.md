@@ -106,6 +106,23 @@ The fix is three small things: broadcast with a timeout (or asynchronously), sam
 background thread, and activate an existing panel with `ShowWindowAsync` instead of the synchronous
 `ShowWindow`.
 
+## Why the screen could start flickering while you were using the PC
+
+The "keep the display off" loop asked a flag (`$script:locked`) whether the session was locked, and
+that flag was set from a `SessionSwitch` handler registered with `Register-ObjectEvent`. A PowerShell
+event `-Action` block runs in its own scope, so `$script:locked = $false` on unlock wrote to the event
+handler's scope, not the script's. Once the guard had locked the screen **once**, the flag stayed
+`true` for the rest of the process lifetime — and the retry loop then kept re-sending
+`SC_MONITORPOWER` every 10 seconds whenever the idle counter passed 120 seconds. Two minutes of not
+touching the keyboard (watching a video, reading a document) was enough to get the display turned off
+over and over: the screen blinks, then comes back, then goes dark again.
+
+The flag is gone. The guard now asks Windows which desktop is currently receiving input
+(`OpenInputDesktop` → `GetUserObjectInformation`, looking for `Winlogon` / `LockApp`), so unlocking
+clears the state automatically. On top of that, a failed idle-time read (`-1`) no longer counts as
+"idle", and two screen-off broadcasts are always at least 25 seconds apart.
+
+
 ## Safety
 
 `action: "lock"` locks the machine immediately, including the session you are talking to the agent from.
@@ -153,5 +170,16 @@ MIT — see [LICENSE](./LICENSE).
 
 现在改成三处：广播关屏走 `SendMessageTimeout`（400ms 上限）或纯异步 `PostMessage`、CPU 采样搬到
 后台线程、激活已有窗口用 `ShowWindowAsync`。界面线程不再做任何可能无限等待的事。
+
+**为什么用着用着屏幕会自己反复熄灭**：以前「锁屏后压制亮屏」靠一个 `$script:locked` 变量判断
+是否还锁着屏，而这个变量是在 `Register-ObjectEvent` 的 `SessionSwitch` 事件里改的。PowerShell 的
+事件 `-Action` 有独立作用域，解锁时那句 `$script:locked = $false` 根本写不回主脚本 —— 于是只要
+锁过一次屏，这个标志在剩下的进程生命周期里永远是 `true`，重发关屏的逻辑就变成「只要闲置超过
+120 秒就每 10 秒关一次屏」。你只是两分钟没碰键鼠（看视频、读文档），屏幕就会黑一下、亮一下、
+再黑一下。
+
+现在不靠标志了：直接用 `OpenInputDesktop` + `GetUserObjectInformation` 问 Windows 当前输入桌面
+是不是 `Winlogon` / `LockApp`，解锁后状态自动复位。另外 `GetLastInputInfo` 失败（返回 -1）不再
+被当成「该关屏」，两次关屏广播至少间隔 25 秒。
 
 安装：用 `plugin_manager` 的 `install_bundle` 指向本目录绝对路径即可。

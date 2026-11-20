@@ -66,6 +66,32 @@ namespace PcGuard {
     [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
     [StructLayout(LayoutKind.Sequential)]
     public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+
+    // 判断当前输入桌面是不是锁屏桌面（Winlogon / LockApp）。
+    // 比"自己记一个我锁过屏"的标志可靠：解锁后输入桌面变回 Default，状态自动复位。
+    // 之前用 SessionSwitch 事件里的 $script:locked 做判断，事件 Action 有独立作用域，
+    // 解锁时那次赋值写不到主脚本里，于是一旦锁过屏就永远认为"还在锁屏"，
+    // 用户正常用着（只是两分钟没碰键鼠）屏幕就被每 10 秒关一次 —— 就是那次黑屏闪烁。
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, System.Text.StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+    public static bool IsLockedDesktop() {
+      const uint DESKTOP_READOBJECTS = 0x0001;
+      const int UOI_NAME = 2;
+      IntPtr h = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
+      if (h == IntPtr.Zero) { return true; }
+      try {
+        var sb = new System.Text.StringBuilder(256);
+        int need;
+        if (!GetUserObjectInformation(h, UOI_NAME, sb, 512, out need)) { return true; }
+        string name = sb.ToString();
+        return name.IndexOf("Winlogon", StringComparison.OrdinalIgnoreCase) >= 0
+            || name.IndexOf("LockApp", StringComparison.OrdinalIgnoreCase) >= 0;
+      } catch { return true; }
+      finally { CloseDesktop(h); }
+    }
+
     [DllImport("kernel32.dll")] public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS lpSystemPowerStatus);
     [StructLayout(LayoutKind.Sequential)]
     public struct SYSTEM_POWER_STATUS {
@@ -155,6 +181,7 @@ $script:pausedAt    = $null
 $script:lowSince    = $null
 $script:highStreak  = 0
 $script:locked      = $false
+$script:lastMonitorOff = $null
 $script:autoGuard   = $true
 $script:includeDsh  = $false
 $script:noWake      = $true
@@ -445,11 +472,21 @@ function Update-State {
 
 function Invoke-NoWakeTick {
     if (-not $script:noWake) { return }
-    if (-not $script:locked) { return }
+    # 用真实的输入桌面判断，而不是自己记录的标志
+    $lockedNow = $script:locked
+    try { $lockedNow = [PcGuard.Native]::IsLockedDesktop() } catch { }
+    $script:locked = $lockedNow
+    if (-not $lockedNow) { return }
     $idle = Get-IdleSeconds
-    if ($idle -ge $NoWakeIdleSec -or $idle -lt 0) {
-        Close-MonitorAsync
+    if ($idle -lt 0) { return }            # 取不到空闲时间就什么都不做，绝不拿 -1 当"该关屏"
+    if ($idle -lt $NoWakeIdleSec) { return }
+    # 两次关屏至少间隔 25 秒，避免任何误判把屏幕刷成闪烁
+    if ($script:lastMonitorOff -and ((Get-Date) - $script:lastMonitorOff).TotalSeconds -lt 25) { return }
+    if (-not $script:lastMonitorOff -or ((Get-Date) - $script:lastMonitorOff).TotalSeconds -ge 300) {
+        Write-Log ('锁屏后关屏（已闲置 {0} 秒）' -f [int]$idle)
     }
+    $script:lastMonitorOff = Get-Date
+    Close-MonitorAsync
 }
 
 # ---------- 命令行动作（供 DSH 插件调用） ----------
@@ -1173,6 +1210,7 @@ $timer.Add_Tick({
     }
 
     $lockPrefix = ''
+    try { $script:locked = [PcGuard.Native]::IsLockedDesktop() } catch { }
     if ($script:locked) { $lockPrefix = '已锁屏  ·  ' }
     if ($script:pausedIds.Count -gt 0) {
         $mins = 0
@@ -1236,11 +1274,8 @@ $chkBattery.Add_CheckedChanged({
     }
 })
 
-Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName SessionSwitch -Action {
-    $reason = $Event.SourceEventArgs.Reason
-    if ($reason -eq 'SessionLock') { $script:locked = $true }
-    elseif ($reason -eq 'SessionUnlock') { $script:locked = $false }
-} | Out-Null
+# 锁屏状态不再依赖 SessionSwitch 事件：事件 Action 有独立作用域，对 $script: 的赋值
+# 写不回主脚本，曾导致解锁后仍被当成"锁屏中"。现在统一由 IsLockedDesktop() 读取真实输入桌面。
 
 $form.Add_Shown({
     [PcGuard.CpuSampler]::Start()
