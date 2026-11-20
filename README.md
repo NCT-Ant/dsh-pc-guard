@@ -88,6 +88,23 @@ native Windows chrome — instead of stock WinForms controls:
   close, on manual resume, or after `-ForceResumeMin` minutes as a safety net.
 - The "keep the display off" loop only re-sends `SC_MONITORPOWER`; a display driver that ignores the
   broadcast is out of scope.
+- The panel never blocks its own UI thread: the screen-off broadcast runs through
+  `SendMessageTimeout` (400 ms cap) or plain `PostMessage`, and the CPU counter is sampled on a
+  background thread. Before this, a single unresponsive window — common right after the session locks
+  — could freeze the whole panel until Windows offered to kill it.
+
+## Why the panel used to hang after the screen went off
+
+`SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)` blocks until **every** top-level
+window acknowledges the message, and it has no timeout. The "keep the display off" loop re-sent that
+broadcast every 10 seconds while the session was locked, so one stuck window (explorer after wake,
+an installer, a hung game launcher) froze the message loop for good — the window looked dead and
+Windows eventually offered "PowerShell is not responding". `PerformanceCounter.NextValue()` on the UI
+thread made it worse: it can stall for seconds right after the machine resumes from sleep.
+
+The fix is three small things: broadcast with a timeout (or asynchronously), sample CPU on a
+background thread, and activate an existing panel with `ShowWindowAsync` instead of the synchronous
+`ShowWindow`.
 
 ## Safety
 
@@ -127,5 +144,14 @@ MIT — see [LICENSE](./LICENSE).
 
 **命中进程**会自动识别 OCR 与 DSH 进程；其它程序（如 `ffmpeg`、`chrome`）可以把进程名输入到
 输入框点「添加」，名单保存在 `assets/pc-guard.custom.txt`，按「进程名包含该字符串」匹配，重启后仍在。
+
+**为什么以前息屏一段时间后点它就没响应**：关屏用的是
+`SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)`，它会同步等待**每一个**顶层窗口
+应答，而且没有超时；锁屏期间这个广播每 10 秒重发一次，只要有一个窗口卡住（唤醒后的 explorer、
+安装程序、挂住的启动器都算），消息循环就再也回不来，于是 Windows 弹出「PowerShell 未响应」。
+另外 `PerformanceCounter.NextValue()` 在系统刚从睡眠恢复时可能卡好几秒，而它当时跑在界面线程上。
+
+现在改成三处：广播关屏走 `SendMessageTimeout`（400ms 上限）或纯异步 `PostMessage`、CPU 采样搬到
+后台线程、激活已有窗口用 `ShowWindowAsync`。界面线程不再做任何可能无限等待的事。
 
 安装：用 `plugin_manager` 的 `install_bundle` 指向本目录绝对路径即可。

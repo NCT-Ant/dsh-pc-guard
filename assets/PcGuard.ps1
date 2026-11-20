@@ -45,6 +45,7 @@ if (-not ('PcGuard.Native' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 namespace PcGuard {
   public static class Native {
     [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr hProcess);
@@ -53,8 +54,15 @@ namespace PcGuard {
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr hObject);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool LockWorkStation();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    // 广播关屏必须带超时：HWND_BROADCAST 的 SendMessage 会同步等待每一个顶层窗口，
+    // 只要有一个窗口卡住（锁屏后很常见），调用线程就永远回不来 —— 界面随即变成"未响应"。
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
     [StructLayout(LayoutKind.Sequential)]
     public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
@@ -68,6 +76,70 @@ namespace PcGuard {
       public int BatteryLifeTime;
       public int BatteryFullLifeTime;
     }
+  }
+
+  // CPU 采样放到后台线程：PerformanceCounter 在系统刚从睡眠/息屏恢复时可能卡住好几秒，
+  // 如果它在 UI 线程上跑，整个窗口就会假死。这里只留一个原子读的数字给界面。
+  public static class CpuSampler {
+    private static Thread _thread;
+    private static volatile bool _started;
+    private static int _centi = -1;   // cpu*100；-1 = 还没采到，-2 = 当前不可用
+    private static string _error = "";
+
+    public static void Start() {
+      if (_started) return;
+      _started = true;
+      try {
+        _thread = new Thread(Loop);
+        _thread.IsBackground = true;
+        _thread.Priority = ThreadPriority.BelowNormal;
+        _thread.Name = "PcGuardCpu";
+        _thread.Start();
+      } catch (Exception ex) { _centi = -2; _error = ex.Message; }
+    }
+
+    private static void Loop() {
+      while (true) {
+        System.Diagnostics.PerformanceCounter pc = null;
+        try {
+          pc = new System.Diagnostics.PerformanceCounter("Processor", "% Processor Time", "_Total");
+          pc.NextValue();
+        } catch (Exception ex) {
+          _error = ex.Message;
+          _centi = -2;
+          pc = null;
+        }
+        if (pc != null) {
+          try { pc.NextValue(); } catch { }      // 第一次读数是 0，先预热
+          Thread.Sleep(250);
+          while (true) {
+            try {
+              float v = pc.NextValue();
+              if (v < 0f) v = 0f;
+              if (v > 100f) v = 100f;
+              _centi = (int)Math.Round(v * 100.0);
+            } catch (Exception ex) {
+              _error = ex.Message;
+              _centi = -2;
+              break;
+            }
+            Thread.Sleep(700);
+          }
+          try { pc.Dispose(); } catch { }
+        }
+        Thread.Sleep(5000);   // 计数器坏了就重建，别让线程退出
+      }
+    }
+
+    public static double Cpu {
+      get {
+        int c = _centi;
+        if (c < 0) return -1.0;
+        return c / 100.0;
+      }
+    }
+    public static bool Ready { get { return _centi >= 0; } }
+    public static string Error { get { return _error == null ? "" : _error; } }
   }
 }
 '@
@@ -112,11 +184,15 @@ try {
 } catch { Write-Log "PerformanceCounter 不可用，改用 CIM: $($_.Exception.Message)" }
 
 function Get-CpuPercent {
+    $v = [PcGuard.CpuSampler]::Cpu
+    if ($v -ge 0) { return [math]::Round($v, 1) }
+    # 界面线程上绝不同步采样：采样器不可用时就沿用上一次的读数，宁可显示旧值也别假死。
+    if ($Action -eq 'ui') { return [double]$script:lastCpu }
     if ($script:cpuCounter) {
         try { return [math]::Round([double]$script:cpuCounter.NextValue(), 1) } catch { }
     }
     try {
-        $p = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
+        $p = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -OperationTimeoutSec 5 -ErrorAction Stop
         return [double]$p.PercentProcessorTime
     } catch { return -1 }
 }
@@ -206,14 +282,36 @@ function Invoke-BatteryTick {
 }
 
 function Close-Monitor {
-    [void][PcGuard.Native]::SendMessage($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND, [IntPtr]$SCRIPT:SC_MONITORPOWER, [IntPtr]2)
+    # 带超时的广播：400 毫秒内没人应答就改发异步消息，绝不让主线程被别人的窗口拖住。
+    $res = [IntPtr]::Zero
+    try {
+        $ok = [PcGuard.Native]::SendMessageTimeout($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND,
+                [IntPtr]$SCRIPT:SC_MONITORPOWER, [IntPtr]2, 0x0002, 400, [ref]$res)
+        if ($ok -eq [IntPtr]::Zero) {
+            [void][PcGuard.Native]::PostMessage($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND,
+                [IntPtr]$SCRIPT:SC_MONITORPOWER, [IntPtr]2)
+        }
+    } catch {
+        try {
+            [void][PcGuard.Native]::PostMessage($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND,
+                [IntPtr]$SCRIPT:SC_MONITORPOWER, [IntPtr]2)
+        } catch { }
+    }
+}
+
+function Close-MonitorAsync {
+    # 纯异步投递，立即返回：定时补发关屏时不该因为别人的窗口慢而让界面卡顿
+    try {
+        [void][PcGuard.Native]::PostMessage($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND,
+            [IntPtr]$SCRIPT:SC_MONITORPOWER, [IntPtr]2)
+    } catch { }
 }
 
 function Lock-Screen {
     $script:locked = $true
     [void][PcGuard.Native]::LockWorkStation()
     Write-Log '已锁屏（后台程序保持运行，不休眠）'
-    Start-Sleep -Milliseconds 600
+    # 不再 Start-Sleep 等锁屏动画：关屏本身带超时，锁屏期间 noWake 还会继续补发。
     Close-Monitor
 }
 
@@ -231,7 +329,7 @@ function Get-TargetProcesses {
     }
     $filter = ($wqlNames -join ' OR ')
     $procs = @()
-    try { $procs = Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop } catch { }
+    try { $procs = Get-CimInstance Win32_Process -Filter $filter -OperationTimeoutSec 8 -ErrorAction Stop } catch { }
     foreach ($p in $procs) {
         if ($p.ProcessId -eq $PID) { continue }
         $cl = ''
@@ -350,7 +448,7 @@ function Invoke-NoWakeTick {
     if (-not $script:locked) { return }
     $idle = Get-IdleSeconds
     if ($idle -ge $NoWakeIdleSec -or $idle -lt 0) {
-        Close-Monitor
+        Close-MonitorAsync
     }
 }
 
@@ -362,8 +460,13 @@ if ($Action -ne 'ui') {
             Write-Output '{"ok":true,"action":"lock"}'
         }
         'status' {
-            # 预热一次计数器，避免刚启动时采样到 0
-            Start-Sleep -Milliseconds 300
+            # 后台采样器先跑起来，等它拿到第一个读数（不是同步空转 CPU 计数器）
+            [PcGuard.CpuSampler]::Start()
+            $waited = 0
+            while (-not [PcGuard.CpuSampler]::Ready -and $waited -lt 1500) {
+                Start-Sleep -Milliseconds 100
+                $waited += 100
+            }
             $cpu = Get-CpuPercent
             if ($cpu -lt 0) { $cpu = 0 }
             $targets = @(Get-TargetProcesses)
@@ -426,8 +529,9 @@ if (-not $script:mutex.WaitOne(0)) {
         Where-Object { $_.MainWindowTitle -eq '锁屏管家' } |
         Select-Object -First 1
     if ($open -and $open.MainWindowHandle -ne 0) {
-        [void][PcGuard.Native]::ShowWindow($open.MainWindowHandle, 9)
-        [void][PcGuard.Native]::SetForegroundWindow($open.MainWindowHandle)
+        # 异步版本：旧窗口要是已经卡住，同步的 ShowWindow 会把新进程一起拖死
+        [void][PcGuard.Native]::ShowWindowAsync($open.MainWindowHandle, 9)
+        try { [void][PcGuard.Native]::SetForegroundWindow($open.MainWindowHandle) } catch { }
     }
     Write-Log 'PcGuard 已在运行，已尝试激活已有窗口'
     if (-not $Headless) { Write-Host 'PcGuard 已在运行' }
@@ -436,6 +540,7 @@ if (-not $script:mutex.WaitOne(0)) {
 
 # ---------- 无界面模式 ----------
 if ($Headless) {
+    [PcGuard.CpuSampler]::Start()
     Write-Log "PcGuard 无界面守护启动：暂停阈值 $CpuPause%，恢复阈值 $CpuResume% / $ResumeHoldMin 分钟"
     while ($true) {
         [void](Update-State)
@@ -1095,7 +1200,7 @@ $timer.Add_Tick({
 $timer.Start()
 
 $timerList = New-Object System.Windows.Forms.Timer
-$timerList.Interval = 15000
+$timerList.Interval = 20000
 $timerList.Add_Tick({ try { Refresh-TargetList } catch { } })
 $timerList.Start()
 
@@ -1138,6 +1243,7 @@ Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName Se
 } | Out-Null
 
 $form.Add_Shown({
+    [PcGuard.CpuSampler]::Start()
     try {
         [void][PcGuard.Native]::ShowWindow($form.Handle, 1)
         [void][PcGuard.Native]::ShowWindow($form.Handle, 5)
