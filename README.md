@@ -6,13 +6,32 @@ A tiny [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin for Windo
 | action | what it does |
 | --- | --- |
 | `lock` | Locks the current Windows workstation and turns the display off. Background programs keep running; the machine never sleeps, shuts down, or restarts. Unlocking returns to the exact same desktop. |
-| `status` | Samples total CPU usage, the current idle time, battery percentage and whether the machine is on AC power, so the agent can decide whether the machine is too busy — or too low on battery — for heavy OCR / video / agent work. |
+| `sleep` | Turns the **display** off and nothing else: the session stays unlocked, so background jobs and other plugins (a WeChat upload, for instance) keep working. Touching the keyboard or mouse brings the picture straight back, no password. |
+| `wake` | Turns the display back on **without** unlocking, and reports whether the session was merely dimmed or genuinely locked — so an agent knows whether it may proceed or has to ask you to type your password. |
+| `status` | Samples total CPU usage, the current idle time, battery percentage and whether the machine is on AC power, plus the real lock state (`locked`) and whether a send lease is active (`sendLease`), so the agent can decide whether the machine is too busy — or too low on battery — for heavy OCR / video / agent work. |
 | `ui` | Opens the PC Guard panel — the small window with the live CPU readout, one-click lock and the automatic guard. If it is already open, it is brought to the front instead of opening a second copy. |
 | `shortcut` | Puts a **锁屏管家** shortcut on the desktop that opens the same panel, so the feature is one double-click away when you are not talking to the agent. The shortcut launches through a generated `launch.vbs` (wscript), so Windows never shows a PowerShell console window — and closing that console can no longer take the panel down with it. |
 
 The repository also ships the standalone `assets/PcGuard.ps1` script it is built on: a small WinForms
-window with a live CPU readout, a one-click lock button, an automatic CPU guard (suspend OCR / agent
+window with a live CPU readout, a one-click lock button, an explicit **display-off** button, an automatic CPU guard (suspend OCR / agent
 processes above a threshold, resume after the load drops), a low-battery guard, and a "keep the display off while locked" loop.
+
+**Display-off is not lock.** The idle action turns the display off and leaves the session unlocked, so
+whatever runs in the background keeps running. `LockWorkStation` only happens when you press the lock
+button or call the `lock` action. This distinction matters once an agent is expected to push a file
+while you are away from the desk.
+
+**Send lease.** Before an agent starts something that needs the screen to stay on (uploading a file
+over WeChat, for example), it writes one line of JSON to `%TEMP%\dsh-wechat-send.lease`:
+
+```json
+{"pid":4196,"expires":1795521048071,"note":"wechat send-file"}
+```
+
+While that file exists and its `expires` (Unix milliseconds) is still in the future, the guard will not
+blank the display, will not lock, will not re-blank, and holds `SetThreadExecutionState` so Windows does
+not blank it either. An expired file is deleted the next time the guard looks at it, so a crashed sender
+can never keep your screen awake forever.
 
 ## Why
 
@@ -40,7 +59,9 @@ Or keep it in a profile as a linked checkout during development.
 Once installed, ask the agent to lock the screen, open the panel, or leave a desktop icon, or call the tool directly:
 
 ```text
-pc_guard { action: "lock" }
+pc_guard { action: "lock" }      # lock + display off (needs the password to come back)
+pc_guard { action: "sleep" }     # display off only, session stays unlocked
+pc_guard { action: "wake" }      # display on, reports whether it is actually locked
 pc_guard { action: "status" }
 pc_guard { action: "ui" }        # open the PC Guard panel
 pc_guard { action: "shortcut" }  # put a 锁屏管家 icon on the desktop
@@ -139,9 +160,24 @@ MIT — see [LICENSE](./LICENSE).
 这是一个 Windows 专用的 DeepSeek Harness 插件，把「一键锁屏 + CPU 守护」包装成 `pc_guard` 工具：
 
 - `lock`：调用 `user32!LockWorkStation` 锁定工作站并关屏，后台程序全部保留，不休眠、不关机；
-- `status`：返回当前 CPU 占用、空闲秒数与电池状态（电量、是否接电源）；
+- `sleep`：**只熄屏**，不锁会话 —— 后台任务、别的插件（比如微信上传）照常跑，碰一下键鼠画面就回来，不用输密码；
+- `wake`：把屏幕点亮但**不解锁**，并如实回报当前是真锁着还是只是熄屏，agent 据此决定继续干还是等你输密码；
+- `status`：返回当前 CPU 占用、空闲秒数、电池状态（电量、是否接电源），以及真实的锁定状态 `locked` 与发送租约 `sendLease`；
 - `ui`：打开 锁屏管家小窗（实时 CPU、一键锁屏、自动守护）；已开着就拉到前台；
 - `shortcut`：在桌面生成「锁屏管家」快捷方式，双击即可打开同一个小窗。快捷方式实际指向 `assets/launch.vbs`（由 wscript 启动），所以**不会再弹出 PowerShell 黑框**，也就不会出现「关掉黑框把管家一起关掉」的问题。
+
+**熄屏 ≠ 锁屏。** 空闲动作默认只熄屏，保持会话解锁，后台该跑什么还跑什么；只有按「一键锁屏」
+按钮或调用 `lock` 才会 `LockWorkStation`。这个区分在「人离开、agent 还要发文件」的场景里是刚需。
+
+**发送租约。** agent 在需要屏幕保持亮着的操作前（例如微信发文件），往
+`%TEMP%\dsh-wechat-send.lease` 写一行 JSON：
+
+```json
+{"pid":4196,"expires":1795521048071,"note":"wechat send-file"}
+```
+
+文件存在且 `expires`（Unix 毫秒）未到期期间，管家不熄屏、不锁屏、不重复关屏，并用
+`SetThreadExecutionState` 顶住系统的空闲熄屏。到期的残租约会被顺手删掉，发送方崩了也不会让屏幕永远亮着。
 
 附带的 `assets/PcGuard.ps1` 也可以脱离 DSH 单独运行，带一个小窗口：实时 CPU、一键锁屏、CPU 超阈值
 自动暂停 OCR / 进程、锁屏后压制自动亮屏，以及**低电量保护**：
@@ -155,9 +191,10 @@ MIT — see [LICENSE](./LICENSE).
 
 - CPU 大号数字配阈值渐变进度条（蓝 → 橙 → 红）；
 - 「状态」单独一行大字加粗，下面是独立的电池行，左侧图标随电量填充；
-- 五个胶囊开关：CPU 守护、含 DSH、压制亮屏、空闲自动锁屏、低电量保护；
+- 五个胶囊开关：CPU 守护、含 DSH、压制亮屏、空闲自动熄屏、低电量保护；
 - 命中进程列表 + 自定义进程输入框；
-- 一键锁屏 / 立即暂停 / 恢复 三个按钮。
+- 一键锁屏 / 熄屏（可继续收发） / 立即暂停 / 恢复 四个按钮；
+- 底部一行提示写清楚：熄屏不锁会话、锁屏要输密码。
 
 **命中进程**会自动识别 OCR 与 DSH 进程；其它程序（如 `ffmpeg`、`chrome`）可以把进程名输入到
 输入框点「添加」，名单保存在 `assets/pc-guard.custom.txt`，按「进程名包含该字符串」匹配，重启后仍在。
