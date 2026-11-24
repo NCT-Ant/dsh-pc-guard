@@ -149,6 +149,17 @@ clears the state automatically. On top of that, a failed idle-time read (`-1`) n
 `action: "lock"` locks the machine immediately, including the session you are talking to the agent from.
 Do not bind it to a hotkey you cannot undo.
 
+**A lease cannot undo a lock that already happened.** The send lease stops the guard from blanking the
+display and stops Windows from blanking it while the lease runs, but once the session is locked the
+lease has nothing to unlock — the password is the only way back. If a job has to push something out
+while you are away, take the lease *before* the screen goes off, or leave the session unlocked with the
+display-off button instead of locking it.
+
+Also note that choosing **display off** is not a promise that the session stays unlocked: closing the
+lid, pressing the sleep key, or anything else that puts the machine into sleep can lock the session by
+itself, and that is Windows doing it, not the guard. The guard never calls `LockWorkStation` on the
+display-off path.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
@@ -178,6 +189,16 @@ MIT — see [LICENSE](./LICENSE).
 
 文件存在且 `expires`（Unix 毫秒）未到期期间，管家不熄屏、不锁屏、不重复关屏，并用
 `SetThreadExecutionState` 顶住系统的空闲熄屏。到期的残租约会被顺手删掉，发送方崩了也不会让屏幕永远亮着。
+
+**安全边界，两件事要说清楚。**
+
+一是**租约救不回已经锁掉的会话**。租约能阻止管家熄屏、也能阻止系统空闲熄屏，但会话一旦锁上，
+租约没有任何办法解锁 —— 只有输密码。所以需要「人不在、任务还要往外发」时，租约要在屏幕熄灭
+**之前**就拿到；或者干脆用「熄屏」按钮而不是锁屏。
+
+二是**熄屏不等于保证会话一直解锁**。管家这条路径从不调用 `LockWorkStation`，但合盖、按睡眠键、
+开始菜单里的「睡眠」这些系统动作都会自己把会话锁上，那不是管家干的。这一点很容易混：你按的是
+管家面板上的「熄屏」，笔记本随后因为合盖进睡眠，回来看到的就是锁屏界面。
 
 附带的 `assets/PcGuard.ps1` 也可以脱离 DSH 单独运行，带一个小窗口：实时 CPU、一键锁屏、CPU 超阈值
 自动暂停 OCR / 进程、锁屏后压制自动亮屏，以及**低电量保护**：
