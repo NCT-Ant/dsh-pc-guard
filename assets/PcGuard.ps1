@@ -22,7 +22,7 @@ param(
     [int]$AutoLockMin = 10,
     [int]$LowBatteryPct = 20,
     [int]$LowBatteryResumePct = 25,
-    [ValidateSet('ui', 'lock', 'status', 'shortcut')]
+    [ValidateSet('ui', 'lock', 'wake', 'sleep', 'status', 'shortcut')]
     [string]$Action = 'ui',
     [switch]$Headless,
     [switch]$SelfTest
@@ -67,16 +67,31 @@ namespace PcGuard {
     [StructLayout(LayoutKind.Sequential)]
     public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
 
-    // 判断当前输入桌面是不是锁屏桌面（Winlogon / LockApp）。
-    // 比"自己记一个我锁过屏"的标志可靠：解锁后输入桌面变回 Default，状态自动复位。
-    // 之前用 SessionSwitch 事件里的 $script:locked 做判断，事件 Action 有独立作用域，
-    // 解锁时那次赋值写不到主脚本里，于是一旦锁过屏就永远认为"还在锁屏"，
-    // 用户正常用着（只是两分钟没碰键鼠）屏幕就被每 10 秒关一次 —— 就是那次黑屏闪烁。
+    // 判断当前会话是不是锁屏状态。
+    // 主用 WTSQuerySessionInformation(WTSSessionInfoEx) 的 SessionFlags：0x1 = 已锁定。
+    // 这个值由系统维护，解锁自动清零，不依赖"我锁过屏"这类自定义标志。
+    // 曾经用 SessionSwitch 事件里的 $script:locked 判断，事件 Action 有独立作用域，
+    // 解锁时的赋值写不回主脚本，于是锁过一次屏就永远认为还锁着 —— 用户两分钟不碰键鼠，
+    // 屏幕就被每 10 秒关一次，表现为黑屏闪烁。
+    // OpenInputDesktop 只作兜底：某些环境下它锁屏时仍返回 Default。
+    [DllImport("wtsapi32.dll", SetLastError=true)]
+    public static extern bool WTSQuerySessionInformation(IntPtr hServer, int sessionId, int wtsInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
+    [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr pMemory);
+    [DllImport("kernel32.dll")] public static extern int WTSGetActiveConsoleSessionId();
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr hDesktop);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
     public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, System.Text.StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
     public static bool IsLockedDesktop() {
+      try {
+        int sid = WTSGetActiveConsoleSessionId();
+        IntPtr buf; int bytes;
+        if (WTSQuerySessionInformation(IntPtr.Zero, sid, 25 /* WTSSessionInfoEx */, out buf, out bytes) && buf != IntPtr.Zero) {
+          try {
+            if (bytes >= 32) { int flags = Marshal.ReadInt32(buf, 28); return (flags & 0x1) != 0; }
+          } finally { WTSFreeMemory(buf); }
+        }
+      } catch { }
       const uint DESKTOP_READOBJECTS = 0x0001;
       const int UOI_NAME = 2;
       IntPtr h = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
@@ -187,9 +202,17 @@ $script:includeDsh  = $false
 $script:noWake      = $true
 $script:autoLock    = $true
 $script:autoLockMin = $AutoLockMin
+$script:idleMode    = 'screen'   # 'screen' = 只熄屏（保持解锁，后台照跑）；'lock' = 真锁屏；'off' = 不动作
+$script:idleScreenDone = $false
 $script:lastLockAt  = [datetime]::MinValue
 $script:lastCpu     = 0
 $script:extraNames  = @()
+# 发送租约：别的插件（如微信发送）在动手前写一个带过期时间的文件，
+# 租约有效期内我们不熄屏、不锁屏、不重复关屏、不摘窗口置顶 ——
+# 否则"熄屏发文件"这条路上，屏幕一黑、会话一锁，发送就必然失败。
+$script:leaseFile   = Join-Path $env:TEMP 'dsh-wechat-send.lease'
+$script:leaseLogged = ''
+$script:leaseOn     = $false
 try {
     $customFile = Join-Path $script:Root 'pc-guard.custom.txt'
     if (Test-Path -LiteralPath $customFile) {
@@ -234,6 +257,51 @@ function Get-IdleSeconds {
         return [math]::Round($delta / 1000.0, 1)
     }
     return -1
+}
+
+# 读取发送租约。约定：%TEMP%\dsh-wechat-send.lease 里一行 JSON，
+# {"pid":1234,"expires":<Unix 毫秒>,"note":"wechat send_file"}。
+# 文件存在、能解析、expires 还没到，就算租约生效。
+# 任何一步出问题都返回 false（宁可不管，也不要因为读不到文件就永远不熄屏）。
+function Test-SendLease {
+    try {
+        if (-not (Test-Path -LiteralPath $script:leaseFile)) { return $false }
+        $raw = Get-Content -LiteralPath $script:leaseFile -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        $exp = 0
+        try { $exp = [int64]$obj.expires } catch { return $false }
+        if ($exp -le 0) { return $false }
+        $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        if ($nowMs -ge $exp) {
+            # 到期就清掉：发送方崩溃留下的残租约不能变成"永远不熄屏"
+            try { Remove-Item -LiteralPath $script:leaseFile -Force -ErrorAction SilentlyContinue } catch { }
+            return $false
+        }
+        return $true
+    } catch { return $false }
+}
+
+# 租约生效时，除了"管家自己不动手"，还要让系统也别自己熄屏/睡眠。
+# SetThreadExecutionState 是线程级的，UI 定时器跑在 UI 线程上，所以在这里设有效。
+function Invoke-LeaseGuard {
+    $on = Test-SendLease
+    if ($on) {
+        try {
+            [void][PcGuard.Native]::SetThreadExecutionState(
+                [PcGuard.Native]::ES_CONTINUOUS -bor [PcGuard.Native]::ES_SYSTEM_REQUIRED -bor [PcGuard.Native]::ES_DISPLAY_REQUIRED)
+        } catch { }
+        if ($script:leaseLogged -ne 'on') {
+            Write-Log '发送租约生效，暂停熄屏/锁屏'
+            $script:leaseLogged = 'on'
+        }
+    } elseif ($script:leaseLogged -eq 'on') {
+        try { [void][PcGuard.Native]::SetThreadExecutionState([PcGuard.Native]::ES_CONTINUOUS) } catch { }
+        Write-Log '发送租约结束，恢复空闲动作'
+        $script:leaseLogged = ''
+    }
+    $script:leaseOn = $on
+    return $on
 }
 
 function Get-BatteryInfo {
@@ -309,6 +377,7 @@ function Invoke-BatteryTick {
 }
 
 function Close-Monitor {
+    if ($script:leaseOn) { return }   # 发送租约期间绝不让屏幕黑掉
     # 带超时的广播：400 毫秒内没人应答就改发异步消息，绝不让主线程被别人的窗口拖住。
     $res = [IntPtr]::Zero
     try {
@@ -327,6 +396,7 @@ function Close-Monitor {
 }
 
 function Close-MonitorAsync {
+    if ($script:leaseOn) { return }   # 同上
     # 纯异步投递，立即返回：定时补发关屏时不该因为别人的窗口慢而让界面卡顿
     try {
         [void][PcGuard.Native]::PostMessage($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND,
@@ -334,7 +404,26 @@ function Close-MonitorAsync {
     } catch { }
 }
 
+function Wake-Monitor {
+    # 两条路一起上：广播 SC_MONITORPOWER(-1) 让 DPMS 回亮，再相对抖一下光标让系统认定"有人在用"。
+    # 后者对部分显示器固件更管用；锁屏桌面上鼠标事件会被丢弃，不会有副作用。
+    $res = [IntPtr]::Zero
+    try {
+        [void][PcGuard.Native]::SendMessageTimeout($SCRIPT:HWND_BROADCAST, $SCRIPT:WM_SYSCOMMAND,
+            [IntPtr]$SCRIPT:SC_MONITORPOWER, [IntPtr](-1), 0x0002, 400, [ref]$res)
+    } catch { }
+    try {
+        [PcGuard.Native]::mouse_event([PcGuard.Native]::MOUSEEVENTF_MOVE, 1, 0, 0, [System.UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 40
+        [PcGuard.Native]::mouse_event([PcGuard.Native]::MOUSEEVENTF_MOVE, -1, 0, 0, [System.UIntPtr]::Zero)
+    } catch { }
+}
+
 function Lock-Screen {
+    if ($script:leaseOn) {
+        Write-Log '发送租约生效，跳过本次锁屏'
+        return $false
+    }
     $script:locked = $true
     [void][PcGuard.Native]::LockWorkStation()
     Write-Log '已锁屏（后台程序保持运行，不休眠）'
@@ -472,6 +561,7 @@ function Update-State {
 
 function Invoke-NoWakeTick {
     if (-not $script:noWake) { return }
+    if ($script:leaseOn) { return }        # 发送租约期间不许补发关屏：屏幕得一直亮着
     # 用真实的输入桌面判断，而不是自己记录的标志
     $lockedNow = $script:locked
     try { $lockedNow = [PcGuard.Native]::IsLockedDesktop() } catch { }
@@ -491,10 +581,43 @@ function Invoke-NoWakeTick {
 
 # ---------- 命令行动作（供 DSH 插件调用） ----------
 if ($Action -ne 'ui') {
+    $script:leaseOn = Test-SendLease
     switch ($Action) {
         'lock' {
-            Lock-Screen
-            Write-Output '{"ok":true,"action":"lock"}'
+            if ($script:leaseOn) {
+                Write-Output '{"ok":false,"action":"lock","skipped":true,"reason":"send-lease"}'
+            } else {
+                Lock-Screen
+                Write-Output '{"ok":true,"action":"lock"}'
+            }
+        }
+        'wake' {
+            # 亮屏但不解锁：已经在锁屏界面时，这里只会让"输密码的界面"亮起来。
+            # 真正要能在锁屏状态下发文件，前提是这台机器只是"熄屏"而没被 LockWorkStation。
+            try {
+                [void][PcGuard.Native]::SetThreadExecutionState(
+                    [PcGuard.Native]::ES_CONTINUOUS -bor [PcGuard.Native]::ES_SYSTEM_REQUIRED -bor [PcGuard.Native]::ES_DISPLAY_REQUIRED)
+            } catch { }
+            Wake-Monitor
+            $lockedNow = $false
+            try { $lockedNow = [PcGuard.Native]::IsLockedDesktop() } catch { }
+            $obj = [ordered]@{
+                ok      = $true
+                action  = 'wake'
+                locked  = $lockedNow
+                idleSec = (Get-IdleSeconds)
+            }
+            Write-Output ($obj | ConvertTo-Json -Compress)
+        }
+        'sleep' {
+            if ($script:leaseOn) {
+                Write-Output '{"ok":false,"action":"sleep","skipped":true,"reason":"send-lease"}'
+            } else {
+                $script:idleScreenDone = $true
+                $script:lastMonitorOff = Get-Date
+                Close-Monitor
+                Write-Output '{"ok":true,"action":"sleep","locked":false}'
+            }
         }
         'status' {
             # 后台采样器先跑起来，等它拿到第一个读数（不是同步空转 CPU 计数器）
@@ -515,6 +638,8 @@ if ($Action -ne 'ui') {
                 targets    = $targets.Count
                 batteryPct = $bat.Percent
                 onAC       = $bat.OnAC
+                locked     = $(try { [PcGuard.Native]::IsLockedDesktop() } catch { $false })
+                sendLease  = $script:leaseOn
                 timestamp  = (Get-Date -Format 's')
             }
             Write-Output ($obj | ConvertTo-Json -Compress)
@@ -800,7 +925,7 @@ $script:CardColor = [Guard.T]::Card
 
 $form = New-Object Guard.Shell
 $form.Text = '锁屏管家'
-$form.ClientSize = New-Object System.Drawing.Size(480, 780)
+$form.ClientSize = New-Object System.Drawing.Size(480, 820)
 $form.StartPosition = 'CenterScreen'
 
 # ---------- 标题栏 ----------
@@ -970,7 +1095,7 @@ $chkNoWake.Checked = $true
 $form.Controls.Add($chkNoWake)
 
 $chkAutoLock = New-Object Guard.Toggle
-$chkAutoLock.Text = ('空闲 {0} 分钟后自动锁屏（锁屏后自动熄屏）' -f $AutoLockMin)
+$chkAutoLock.Text = ('空闲 {0} 分钟后自动熄屏（保持解锁，后台照跑）' -f $AutoLockMin)
 $chkAutoLock.Location = New-Object System.Drawing.Point(18, 384)
 $chkAutoLock.Size = New-Object System.Drawing.Size(444, 26)
 $chkAutoLock.Checked = $true
@@ -1061,16 +1186,27 @@ $form.Controls.Add($lblCustomInfo)
 # ---------- 三个按钮 ----------
 $btnLock = New-Object Guard.FlatBtn
 $btnLock.Text = '一键锁屏'
-$btnLock.Location = New-Object System.Drawing.Point(16, 648)
-$btnLock.Size = New-Object System.Drawing.Size(200, 48)
+$btnLock.Location = New-Object System.Drawing.Point(16, 636)
+$btnLock.Size = New-Object System.Drawing.Size(218, 46)
 $btnLock.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11.5, [System.Drawing.FontStyle]::Bold)
 $btnLock.Radius = 12
 $form.Controls.Add($btnLock)
 
+# 熄屏：只关显示器，绝不 LockWorkStation。后台的 DSH / 微信发送照常跑，
+# 回来碰一下键鼠屏幕就亮，不需要输密码。
+$btnSleep = New-Object Guard.FlatBtn
+$btnSleep.Text = '熄屏（可继续收发）'
+$btnSleep.Location = New-Object System.Drawing.Point(242, 636)
+$btnSleep.Size = New-Object System.Drawing.Size(218, 46)
+$btnSleep.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
+$btnSleep.Outline = $true
+$btnSleep.Radius = 12
+$form.Controls.Add($btnSleep)
+
 $btnPause = New-Object Guard.FlatBtn
 $btnPause.Text = '立即暂停'
-$btnPause.Location = New-Object System.Drawing.Point(228, 648)
-$btnPause.Size = New-Object System.Drawing.Size(112, 48)
+$btnPause.Location = New-Object System.Drawing.Point(16, 690)
+$btnPause.Size = New-Object System.Drawing.Size(218, 40)
 $btnPause.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
 $btnPause.Outline = $true
 $btnPause.Radius = 12
@@ -1078,18 +1214,18 @@ $form.Controls.Add($btnPause)
 
 $btnResume = New-Object Guard.FlatBtn
 $btnResume.Text = '恢复'
-$btnResume.Location = New-Object System.Drawing.Point(352, 648)
-$btnResume.Size = New-Object System.Drawing.Size(110, 48)
+$btnResume.Location = New-Object System.Drawing.Point(242, 690)
+$btnResume.Size = New-Object System.Drawing.Size(218, 40)
 $btnResume.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
 $btnResume.Outline = $true
 $btnResume.Radius = 12
 $form.Controls.Add($btnResume)
 
 $lblHint = New-Object System.Windows.Forms.Label
-$lblHint.Text = '锁屏不会关闭后台程序，也不会休眠；解锁后一切照旧。'
+$lblHint.Text = '熄屏 ≠ 锁屏：熄屏不锁会话，后台继续跑；锁屏需要输密码才能回来。'
 $lblHint.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
 $lblHint.ForeColor = [Guard.T]::Sub
-$lblHint.Location = New-Object System.Drawing.Point(18, 704)
+$lblHint.Location = New-Object System.Drawing.Point(18, 740)
 $lblHint.Size = New-Object System.Drawing.Size(444, 20)
 $form.Controls.Add($lblHint)
 
@@ -1097,7 +1233,7 @@ $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text = ''
 $lblLog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
 $lblLog.ForeColor = [Guard.T]::Sub
-$lblLog.Location = New-Object System.Drawing.Point(18, 726)
+$lblLog.Location = New-Object System.Drawing.Point(18, 762)
 $lblLog.Size = New-Object System.Drawing.Size(444, 18)
 $form.Controls.Add($lblLog)
 
@@ -1105,7 +1241,7 @@ $lblPaused = New-Object System.Windows.Forms.Label
 $lblPaused.Text = ''
 $lblPaused.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5, [System.Drawing.FontStyle]::Bold)
 $lblPaused.ForeColor = [Guard.T]::Danger
-$lblPaused.Location = New-Object System.Drawing.Point(18, 746)
+$lblPaused.Location = New-Object System.Drawing.Point(18, 782)
 $lblPaused.Size = New-Object System.Drawing.Size(444, 20)
 $form.Controls.Add($lblPaused)
 
@@ -1226,12 +1362,27 @@ $timer.Add_Tick({
         $lblPaused.Text = ''
     }
 
-    # 空闲自动锁屏
-    if ($script:autoLock -and -not $script:locked) {
+    # 空闲动作：熄屏 / 锁屏，两者互斥。
+    # 默认熄屏（idleMode='screen'）：只关显示器、不 LockWorkStation，会话保持解锁，
+    # 后台的 DSH / 微信发送照常跑。要输密码的那种请把 idleMode 切到 'lock'。
+    # 发送租约生效期间一律不动 —— 别的插件正在用这块屏幕发文件。
+    if ($script:idleMode -ne 'off' -and $script:autoLock -and -not $script:leaseOn) {
         $idle = Get-IdleSeconds
-        if ($idle -ge ($script:autoLockMin * 60)) {
-            Write-Log ('空闲 {0} 分钟，自动锁屏' -f $script:autoLockMin)
-            Lock-Screen
+        if ($idle -ge 0) {
+            if ($idle -lt 60) { $script:idleScreenDone = $false }
+            if ($idle -ge ($script:autoLockMin * 60)) {
+                if ($script:idleMode -eq 'lock') {
+                    if (-not $script:locked) {
+                        Write-Log ('空闲 {0} 分钟，自动锁屏' -f $script:autoLockMin)
+                        Lock-Screen
+                    }
+                } elseif (-not $script:idleScreenDone) {
+                    Write-Log ('空闲 {0} 分钟，自动熄屏（保持解锁，微信可继续收发）' -f $script:autoLockMin)
+                    $script:idleScreenDone = $true
+                    $script:lastMonitorOff = Get-Date
+                    Close-MonitorAsync
+                }
+            }
         }
     }
 })
@@ -1251,6 +1402,18 @@ $btnLock.Add_Click({
     Lock-Screen
     $lblStatus.Text = '已锁屏  ·  后台继续运行'
     $lblStatus.ForeColor = [Guard.T]::Ink
+})
+$btnSleep.Add_Click({
+    if ($script:leaseOn) {
+        $lblStatus.Text = '发送中  ·  暂不熄屏/锁屏'
+        $lblStatus.ForeColor = [Guard.T]::Warn
+        return
+    }
+    $script:idleScreenDone = $true
+    $script:lastMonitorOff = Get-Date
+    Close-Monitor
+    $lblStatus.Text = '已熄屏  ·  会话保持解锁，后台照跑'
+    $lblStatus.ForeColor = [Guard.T]::Sub
 })
 $btnPause.Add_Click({
     Pause-All '手动暂停'

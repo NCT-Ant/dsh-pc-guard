@@ -74,6 +74,11 @@ function parseLastJson(text) {
 
 function describe(value) {
   if (value.action === 'lock') return 'Workstation locked; background programs keep running and the machine does not sleep.'
+  if (value.action === 'wake') {
+    const state = value.locked ? 'locked (still needs the password)' : 'unlocked'
+    return `Display woken · ${state} · idle ${Math.round(value.idleSec ?? 0)}s`
+  }
+  if (value.action === 'sleep') return 'Display turned off (the session stays unlocked).'
   if (value.action === 'ui') return 'PC Guard panel opened. It keeps running after this conversation.'
   if (value.action === 'shortcut') return `Desktop shortcut ready: ${value.path ?? '锁屏管家.lnk'}`
   if (typeof value.cpu === 'number') {
@@ -86,7 +91,7 @@ function describe(value) {
   return 'pc_guard finished.'
 }
 
-const ACTIONS = ['lock', 'status', 'ui', 'shortcut']
+const ACTIONS = ['lock', 'wake', 'sleep', 'status', 'ui', 'shortcut']
 
 export const inject = ['tools']
 
@@ -98,6 +103,10 @@ export function apply(ctx) {
         'Windows-only power helper for this machine. '
         + 'action="lock" immediately locks the workstation (same effect as Win+L: every background program keeps running, '
         + 'nothing sleeps or shuts down). '
+        + 'action="wake" turns the display back on without unlocking, and reports whether the session is merely dimmed '
+        + 'or actually locked. '
+        + 'action="sleep" turns the display off while leaving the session unlocked (the machine keeps running). '
+        + 'Use wake before a job that needs the screen on, and sleep right after it finishes, so the screen is not left lit. '
         + 'action="status" samples total CPU usage, user idle time, battery percentage and whether the machine is on AC power, '
         + 'so you can judge machine load before starting heavy work. '
         + 'action="ui" opens the PC Guard panel: a small window with a live CPU gauge, a one-click lock button, '
@@ -112,7 +121,7 @@ export function apply(ctx) {
           action: {
             type: 'string',
             enum: ACTIONS,
-            description: 'lock = lock now; status = sample CPU/idle; ui = open the panel; shortcut = create desktop shortcut.',
+            description: 'lock = lock now; wake = turn the display on; sleep = turn the display off (stays unlocked); status = sample CPU/idle; ui = open the panel; shortcut = create desktop shortcut.',
           },
         },
         required: ['action'],
