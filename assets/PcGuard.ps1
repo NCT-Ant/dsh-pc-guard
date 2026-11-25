@@ -204,6 +204,9 @@ $script:autoLock    = $true
 $script:autoLockMin = $AutoLockMin
 $script:idleMode    = 'screen'   # 'screen' = 只熄屏（保持解锁，后台照跑）；'lock' = 真锁屏；'off' = 不动作
 $script:idleScreenDone = $false
+# 熄屏后是否已经向系统申请"别睡眠"。光关显示器还不够：系统电源计划的空闲睡眠
+# 一到点就会睡过去，一睡会话就锁上，人回来看到的是要输密码的界面。
+$script:idleAwake   = $false
 $script:lastLockAt  = [datetime]::MinValue
 $script:lastCpu     = 0
 $script:extraNames  = @()
@@ -1369,18 +1372,33 @@ $timer.Add_Tick({
     if ($script:idleMode -ne 'off' -and $script:autoLock -and -not $script:leaseOn) {
         $idle = Get-IdleSeconds
         if ($idle -ge 0) {
-            if ($idle -lt 60) { $script:idleScreenDone = $false }
+            if ($idle -lt 60) {
+                $script:idleScreenDone = $false
+                # 人回来了，撤掉"别睡眠"的请求，让系统恢复正常的空闲策略。
+                if ($script:idleAwake) {
+                    try { [void][PcGuard.Native]::SetThreadExecutionState([PcGuard.Native]::ES_CONTINUOUS) } catch { }
+                    $script:idleAwake = $false
+                }
+            }
             if ($idle -ge ($script:autoLockMin * 60)) {
                 if ($script:idleMode -eq 'lock') {
                     if (-not $script:locked) {
-                        Write-Log ('空闲 {0} 分钟，自动锁屏' -f $script:autoLockMin)
+                        Write-Log ('空闲 {0} 分钟（实测 {1} 秒无键鼠输入），自动锁屏' -f $script:autoLockMin, [int]$idle)
                         Lock-Screen
                     }
                 } elseif (-not $script:idleScreenDone) {
-                    Write-Log ('空闲 {0} 分钟，自动熄屏（保持解锁，微信可继续收发）' -f $script:autoLockMin)
+                    Write-Log ('空闲 {0} 分钟（实测 {1} 秒无键鼠输入），自动熄屏（保持解锁，微信可继续收发）' -f $script:autoLockMin, [int]$idle)
                     $script:idleScreenDone = $true
                     $script:lastMonitorOff = Get-Date
                     Close-MonitorAsync
+                    # 只关屏、不睡眠：系统电源计划的空闲睡眠一到点就会锁会话，
+                    # 顶住它，屏幕熄灭但会话保持解锁，回来一碰就亮、不用输密码。
+                    try {
+                        [void][PcGuard.Native]::SetThreadExecutionState(
+                            [PcGuard.Native]::ES_CONTINUOUS -bor [PcGuard.Native]::ES_SYSTEM_REQUIRED)
+                        $script:idleAwake = $true
+                        Write-Log '已请求系统保持唤醒，熄屏期间不会进入睡眠（也就不会锁会话）'
+                    } catch { }
                 }
             }
         }
@@ -1457,6 +1475,11 @@ $form.Add_Shown({
 $form.Add_FormClosing({
     $timer.Stop(); $timerList.Stop(); $timerNoWake.Stop()
     if ($script:pausedIds.Count -gt 0) { Resume-All '关闭守护程序' }
+    # 退出前撤掉"别睡眠"的请求，否则关掉面板后系统仍然被我们顶着不睡。
+    if ($script:idleAwake) {
+        try { [void][PcGuard.Native]::SetThreadExecutionState([PcGuard.Native]::ES_CONTINUOUS) } catch { }
+        $script:idleAwake = $false
+    }
     Write-Log '界面已关闭'
 })
 

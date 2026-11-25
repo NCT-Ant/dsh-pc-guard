@@ -160,6 +160,14 @@ lid, pressing the sleep key, or anything else that puts the machine into sleep c
 itself, and that is Windows doing it, not the guard. The guard never calls `LockWorkStation` on the
 display-off path.
 
+**Display off now also keeps the machine awake.** Blanking the display on its own used to leave the
+system's idle sleep timer running: on battery the default is often ten minutes, so the screen went dark
+and the machine went to sleep a moment later — and falling asleep locks the session. That is where the
+"it locked itself while I was using it" report comes from. After blanking the screen the guard now calls
+`SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`, so the display is dark while the session
+stays unlocked and background jobs keep running. The request is dropped as soon as keyboard or mouse
+input comes back, and also when the panel closes, so the machine sleeps normally afterwards.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
@@ -199,6 +207,12 @@ MIT — see [LICENSE](./LICENSE).
 二是**熄屏不等于保证会话一直解锁**。管家这条路径从不调用 `LockWorkStation`，但合盖、按睡眠键、
 开始菜单里的「睡眠」这些系统动作都会自己把会话锁上，那不是管家干的。这一点很容易混：你按的是
 管家面板上的「熄屏」，笔记本随后因为合盖进睡眠，回来看到的就是锁屏界面。
+
+**空闲熄屏会同时顶住系统睡眠。** 以前熄屏只关显示器，系统自己的空闲睡眠照常走：用电池时默认
+十分钟，屏幕刚黑、机器紧跟着睡过去，一睡会话就锁上 —— 这就是「我明明在用，它自己锁了」的真正来源。
+现在熄屏之后会立刻调用 `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` 把机器顶住：
+屏幕黑着，但会话保持解锁、后台照跑。一旦检测到键盘或鼠标输入（或者关掉面板）就撤掉这个请求，
+让系统恢复正常的睡眠策略。
 
 附带的 `assets/PcGuard.ps1` 也可以脱离 DSH 单独运行，带一个小窗口：实时 CPU、一键锁屏、CPU 超阈值
 自动暂停 OCR / 进程、锁屏后压制自动亮屏，以及**低电量保护**：
